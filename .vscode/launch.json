@@ -1,0 +1,67 @@
+{
+    // 使用 IntelliSense 了解相关属性。 
+    // 悬停以查看现有属性的描述。
+    // 欲了解更多信息，请访问: https://go.microsoft.com/fwlink/?linkid=830387
+
+    //export LD_LIBRARY_PATH=${LD_LIBRARY_PATH}:/home/huangwuwei/miniconda3/envs/chap5/lib/
+    "version": "0.2.0",
+    "configurations": [
+
+        {
+            "name": "train",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/legged_gym/legged_gym/scripts/train.py",
+            "console": "integratedTerminal",
+            "args": [
+                    "--task","go2_arm",
+                    //  "--resume",
+                     "--experiment_name","go2_arm",
+                     "--num_envs","10",
+                     "--run_name","test",
+                    // "--run_name","himloco",
+                    
+                    //  "--headless",
+                    //  "--load_run","Nov28_02-58-49_wo_phase_with_terrainprob",
+                    //  "--checkpoint","10000",     
+                    //  "--resume",
+                  "--sim_device","cuda:1",
+                  "--rl_device","cuda:1",
+                  
+                    ]               
+        },
+        {
+            "name": "train_student",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/humanoidGym/script/train_student.py",
+            "console": "integratedTerminal",
+            "args": ["--task","g1",
+                     //"--resume",
+                     "--experiment_name","g1",
+                     "--num_envs","4096",
+                     "--headless",
+                    "--load_run","Sep24_13-37-21_",
+                    "--checkpoint","12000",    
+                    // "--resume"
+                    ]               
+        },
+        {
+            "name": "play",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/humanoidGym/script/play.py",
+            "console": "integratedTerminal",
+            "args": ["--task","g1",
+                     //"--resume",
+                     "--experiment_name","g1",
+                     "--num_envs","4096",
+                    //  "--headless",
+                    "--load_run","teacher",
+                    "--checkpoint","12000",     
+                    //  "--resume"
+                    ]               
+        }
+
+    ]
+}

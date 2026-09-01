@@ -1,0 +1,40 @@
+
+
+
+
+# policy_path: "/home/user/ws/humanoidgym/logs/g1_teacher_vq_num_embed_128/exported/policies/policy.onnx"
+# policy_path: /home/user/ws/humanoidgym/logs/g1_PPOVQ/exported/policies/policy_vq_best1.onnx policy_nice_10lag
+# policy_path: "/home/user/ws/humanoidgym/logs/g1/exported/policies/policy_z.onnx" #policy_filt_1_beyond_penal_yaw
+policy_path: "/home/user/ws/humanoidgym/logs/g1_PPOVQ/exported/policies/policy_vqs.onnx"
+xml_path: "/home/user/ws/deploy/resources/robots/g1_description/scene.xml"
+
+# Total simulation time
+simulation_duration: 600.0
+# Simulation time step
+simulation_dt: 0.001
+# Controller update frequency (meets the requirement of simulation_dt * controll_decimation=0.02; 50Hz)
+control_decimation: 20
+
+# PD gains
+# PD gains
+kps: [40.1771, 99.0906, 40.1771, 99.0906,28.4954, 28.2477,40.1771, 99.0906, 40.1771, 99.0906,28.4954, 28.2477]
+kds: [2.5577,  6.3083,  2.5577,  6.3083, 1.8140,  1.8140, 2.5577,  6.3083,  2.5577,  6.3083, 1.8140,  1.8140]
+
+# Default joint angles for legs
+default_angles: [-0.1, 0.0, 0.0, 0.3, -0.2, 0.0,
+                 -0.1, 0.0, 0.0, 0.3, -0.2, 0.0]
+# Scaling factors
+ang_vel_scale: 0.25
+dof_pos_scale: 1.0
+dof_vel_scale: 0.05
+action_scales: [0.54754647, 0.35066147, 0.54754647, 0.35066147, 0.43857731, 0.43857731,
+                               0.54754647, 0.35066147, 0.54754647, 0.35066147, 0.43857731, 0.43857731]
+cmd_scale: [2.0, 2.0, 0.25]
+
+# Number of actions and observations
+num_actions: 12
+num_obs: 2601  # 51 * 51 (observation dimension * history length)
+obs_history_len: 51
+
+# Initial commands
+cmd_init: [0.5, 0.0, 0.0]

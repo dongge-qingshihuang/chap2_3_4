@@ -1,0 +1,48 @@
+
+
+
+
+# policy_path: "/home/user/ws/humanoidgym/logs/g1_teacher_vq_num_embed_128/exported/policies/policy.onnx"
+# policy_path: /home/user/ws/humanoidgym/logs/g1_PPOVQ/exported/policies/policy_vq_best1.onnx 
+# policy_path: "/home/user/ws/humanoidgym/logs/g1/exported/policies/policy_z.onnx"
+# "/home/user/ws/humanoidgym/logs/g1_PPOVQ_0.005_rand_fric/exported/policies/policy_stair86.onnx" 
+policy_path: "/home/hww/ws/HIMLoco/legged_gym/legged_gym/scripts/LEGGED_GYM_ROOT_DIR/logs/go2/exported/policies/lite_yuhan_mod8.onnx"
+policy_jit_path: "/home/ccm/RL/terrain_h/humanoidGym/logs/g1/num_mode=10/model_9000.pt"
+xml_path: "/home/hww/ws/HIMLoco/legged_gym/resources/robots/go2/scene.xml"
+
+# Total simulation time
+simulation_duration: 5000.0
+# Simulation time step
+simulation_dt: 0.005   #0.001
+# Controller update frequency (meets the requirement of simulation_dt * controll_decimation=0.02; 50Hz)
+control_decimation: 4  #20
+
+# PD gains
+# PD gains
+kps: [40, 40, 40, 40, 40, 40,
+     40, 40, 40, 40, 40, 40]
+kds: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+     1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+
+# Default joint angles for legs
+default_angles: [-0.1, 0.8, -1.5, 0.1, 0.8, -1.5,
+                 -0.1, 1.0, -1.5, 0.1, 1, -1.5]
+#FR FL RR RL
+
+# Scaling factors
+ang_vel_scale: 0.25
+dof_pos_scale: 1.0
+dof_vel_scale: 0.05
+action_scales: 0.25
+cmd_scale: [2.0, 2.0, 0.25]
+
+# Number of actions and observations
+num_actions: 12
+num_obs: 270 #235 #940  # 51 * 51 (observation dimension * history length)
+obs_history_len: 6 #5
+
+# Initial commands
+cmd_init: [0.5, 0.0, 0.0]
+
+cycle_time: 0.6
+
