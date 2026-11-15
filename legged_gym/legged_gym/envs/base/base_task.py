@@ -61,7 +61,8 @@ class BaseTask():
         self.num_obs = cfg.env.num_observations
         self.num_privileged_obs = cfg.env.num_privileged_obs
         self.num_actions = cfg.env.num_actions
-        self.num_arm_actions = cfg.env.num_arm_actions
+        self.num_arm_actions = getattr(cfg.env, "num_arm_actions", 0)
+        self.num_rec = getattr(cfg.env, "num_recon", None)
 
         # optimization flags for pytorch JIT
         torch._C._jit_set_profiling_mode(False)

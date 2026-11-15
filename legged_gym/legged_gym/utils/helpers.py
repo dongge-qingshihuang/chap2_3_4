@@ -181,7 +181,10 @@ def get_args():
     return args
 
 def export_policy_as_jit(actor_critic, path):
-    if hasattr(actor_critic, 'estimator'):
+    if getattr(actor_critic, "is_terrain_moe", False):
+        exporter = PolicyExporterTerrainMoe(actor_critic)
+        exporter.export(path)
+    elif hasattr(actor_critic, 'estimator'):
         # assumes LSTM: TODO add GRU
         exporter = PolicyExporterHIM(actor_critic)
         exporter.export(path)
@@ -262,5 +265,26 @@ class PolicyExporterHIM(torch.nn.Module):
         self.to('cpu')
         traced_script_module = torch.jit.script(self)
         traced_script_module.save(path)
+
+
+class PolicyExporterTerrainMoe(torch.nn.Module):
+    """Export the complete deterministic Go2 terrain-MoE inference path."""
+
+    def __init__(self, actor_critic):
+        super().__init__()
+        self.model = copy.deepcopy(actor_critic).cpu()
+        self.model.eval()
+        self.num_obs = actor_critic.num_actor_obs
+
+    def forward(self, obs_history):
+        return self.model.act_inference(obs_history)
+
+    def export(self, path):
+        os.makedirs(path, exist_ok=True)
+        destination = os.path.join(path, "policy_1.pt")
+        example = torch.zeros(1, self.num_obs)
+        with torch.no_grad():
+            traced = torch.jit.trace(self, example)
+        traced.save(destination)
     
     

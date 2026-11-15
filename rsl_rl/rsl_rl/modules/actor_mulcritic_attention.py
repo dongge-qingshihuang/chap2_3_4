@@ -3,6 +3,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Normal
 
+from .load_aware_weights import (
+    LoadAwareWeightNetwork,
+    weight_entropy,
+)
+
 
 # =========================================================
 #  纯 MLP 版 History Encoder：替代 CNN1dEstimator + Conv1d
@@ -242,6 +247,13 @@ class Actor_mulCritic_attention1(nn.Module):
                  tsdyn_latent_dims=32,
                  terrain_dim: int = 187,
                  num_attn_heads: int = 4,
+                 payload_dim=0,
+                 load_aware_enabled=False,
+                 load_weight_hidden_dim=64,
+                 load_weight_min=0.05,
+                 load_weight_max=0.90,
+                 activation="elu",
+                 init_noise_std=1.0,
                  **kwargs):
         if kwargs:
             print("ActorCritic.__init__ got unexpected arguments, which will be ignored: "
@@ -262,27 +274,45 @@ class Actor_mulCritic_attention1(nn.Module):
         prop_hidden_out = 64
 
         # 第二章黑盒负载感知：估计出的负载状态也送进 actor（本体观测本身不变）
-        self.payload_dim = int(kwargs.get("payload_dim", 0))
+        self.payload_dim = int(payload_dim)
+        self.load_aware_enabled = bool(load_aware_enabled)
+        self.load_weight_min = float(load_weight_min)
+        self.load_weight_max = float(load_weight_max)
+        activation_modules = {
+            "elu": nn.ELU,
+            "relu": nn.ReLU,
+            "lrelu": nn.LeakyReLU,
+            "tanh": nn.Tanh,
+            "selu": nn.SELU,
+        }
+        if activation not in activation_modules:
+            raise ValueError(f"Unsupported activation: {activation}")
 
         # Actor 输入维度：observations(flat) + representation + vel(3) + payload + z_prop
         mlp_input_dim_a = tsdyn_latent_dims + num_actor_obs + 3 + self.payload_dim + prop_latent_dims
         mlp_input_dim_c = num_critic_obs
 
         # ---------- Actor ----------
-        actor_layers = [nn.Linear(mlp_input_dim_a, actor_hidden_dims[0]), nn.ELU()]
+        actor_layers = [
+            nn.Linear(mlp_input_dim_a, actor_hidden_dims[0]),
+            activation_modules[activation](),
+        ]
         for l in range(len(actor_hidden_dims)):
             if l == len(actor_hidden_dims) - 1:
                 actor_layers.append(nn.Linear(actor_hidden_dims[l], num_actions))
             else:
                 actor_layers.append(nn.Linear(actor_hidden_dims[l], actor_hidden_dims[l + 1]))
-                actor_layers.append(nn.ELU())
+                actor_layers.append(activation_modules[activation]())
         self.actor = nn.Sequential(*actor_layers)
 
         # ---------- Critic: shared trunk + 3 heads ----------
-        critic_layers = [nn.Linear(mlp_input_dim_c, critic_hidden_dims[0]), nn.ELU()]
+        critic_layers = [
+            nn.Linear(mlp_input_dim_c, critic_hidden_dims[0]),
+            activation_modules[activation](),
+        ]
         for l in range(len(critic_hidden_dims) - 1):
             critic_layers.append(nn.Linear(critic_hidden_dims[l], critic_hidden_dims[l + 1]))
-            critic_layers.append(nn.ELU())
+            critic_layers.append(activation_modules[activation]())
         self.critic_trunk = nn.Sequential(*critic_layers)
 
         last_dim = critic_hidden_dims[-1]
@@ -300,6 +330,23 @@ class Actor_mulCritic_attention1(nn.Module):
             prop_latent_dims=prop_latent_dims,
             payload_dim=self.payload_dim
         )
+        self.load_weight_net = (
+            LoadAwareWeightNetwork(
+                payload_dim=self.payload_dim,
+                hidden_dim=load_weight_hidden_dim,
+                min_weight=self.load_weight_min,
+                max_weight=self.load_weight_max,
+                num_critics=3,
+            )
+            if self.load_aware_enabled
+            else None
+        )
+        if self.load_aware_enabled and self.payload_dim != 9:
+            raise ValueError(
+                "load_aware_enabled=True requires a 9-D payload estimator"
+            )
+        self.last_payload_prediction = None
+        self.last_load_weights = None
 
         # ---------- TsDyn VAE 模式（MLP版） ----------
         self.TsDyn_modules = nn.ModuleList()
@@ -344,7 +391,9 @@ class Actor_mulCritic_attention1(nn.Module):
 
         # ---------- action distribution ----------
         self.distribution = None
-        self.std = nn.Parameter(torch.ones(num_actions) * 1.0)
+        self.std = nn.Parameter(
+            torch.ones(num_actions) * float(init_noise_std)
+        )
         Normal.set_default_validate_args = False
 
     @staticmethod
@@ -420,6 +469,13 @@ class Actor_mulCritic_attention1(nn.Module):
 
         z_prop, vel_pre, payload_pre = self.prop_encoder.forward_full(observations)
         representation, _ = self._cross_attend_modes(observations)
+        self.last_payload_prediction = payload_pre
+        if self.load_weight_net is not None and payload_pre is not None:
+            self.last_load_weights = self.load_weight_net(
+                payload_pre.detach()
+            )
+        else:
+            self.last_load_weights = None
 
         parts = [observations, representation.detach(), vel_pre.detach()]
         if payload_pre is not None:
@@ -443,6 +499,13 @@ class Actor_mulCritic_attention1(nn.Module):
         z_prop, vel_pre, payload_pre = self.prop_encoder.forward_full(observations)
         z_prop = z_prop.detach()
         vel_pre = vel_pre.detach()
+        self.last_payload_prediction = payload_pre
+        if self.load_weight_net is not None and payload_pre is not None:
+            self.last_load_weights = self.load_weight_net(
+                payload_pre.detach()
+            )
+        else:
+            self.last_load_weights = None
 
         representation, attn_w_mean = self._cross_attend_modes(observations)
         representation = representation.detach()
@@ -480,3 +543,54 @@ class Actor_mulCritic_attention1(nn.Module):
         z_prop, vel_pre = self.prop_encoder(observations)
         representation, attn_w = self._cross_attend_modes(observations)
         return representation
+
+    def get_load_weights(self):
+        return self.last_load_weights
+
+    def get_payload_estimate(self):
+        return self.last_payload_prediction
+
+    def load_aware_diagnostics(self):
+        if self.last_load_weights is None:
+            return None
+        return {
+            "weights": self.last_load_weights,
+            "entropy": weight_entropy(self.last_load_weights).mean(),
+        }
+
+    def ppo_parameters(self):
+        modules = (
+            self.actor,
+            self.critic_trunk,
+            self.critic_task,
+            self.critic_stab,
+            self.critic_energy,
+        )
+        parameters = [
+            parameter
+            for module in modules
+            for parameter in module.parameters()
+        ]
+        parameters.append(self.std)
+        return parameters
+
+    def payload_parameters(self):
+        if self.prop_encoder.payload_head is None:
+            return []
+        return list(self.prop_encoder.parameters())
+
+    def load_gate_parameters(self):
+        if self.load_weight_net is None:
+            return []
+        return list(self.load_weight_net.parameters())
+
+    def architecture_metadata(self):
+        return {
+            "policy_class": type(self).__name__,
+            "num_actor_obs": self.ctx_dim,
+            "payload_dim": self.payload_dim,
+            "load_aware_enabled": self.load_aware_enabled,
+            "load_weight_min": self.load_weight_min,
+            "load_weight_max": self.load_weight_max,
+            "num_critics": 3,
+        }

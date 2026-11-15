@@ -41,3 +41,12 @@ from .actor_critic_servo import ActorCriticArmServo
 from .actor_critic_film import ActorCriticArmServoDogPrior
 from .actor_critic_no_film import ActorCriticArmServoDogPrior_nofilm
 from .base_residual import BaseResidual
+from .terrain_moe_actor_critic import TerrainMoeActorCritic
+from .terrain_moe_attention import TerrainMoeAttentionActorCritic
+from .terrain_actor_moe import TerrainActorMoEActorCritic
+from .load_aware_weights import (
+    LoadAwareWeightNetwork,
+    physical_prior_weights,
+    payload_prediction_errors,
+    weight_entropy,
+)

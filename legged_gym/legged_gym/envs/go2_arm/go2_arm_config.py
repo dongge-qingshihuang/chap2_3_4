@@ -29,7 +29,41 @@
 # Copyright (c) 2021 ETH Zurich, Nikita Rudin
 
 from legged_gym.envs.base.legged_robot_config import LeggedRobotCfg, LeggedRobotCfgPPO
+from legged_gym import LEGGED_GYM_ROOT_DIR
+import os
 import torch
+
+# =============================================================================
+# 多评论家负载感知实验：
+#   A  : 单评论家 + 无负载估计 + 固定权重
+#   B  : 三评论家 + 无负载估计 + 固定权重
+#   C  : 三评论家 + 负载估计 + 固定权重
+#   D  : 三评论家 + 负载估计 + 动态负载权重
+#   D1 : D，关闭权重平滑损失
+#   D2 : D，关闭物理先验监督（只保留平滑项）
+#   D3 : 完整 D
+# =============================================================================
+EXPERIMENT_MODE = os.environ.get("GO2_ARM_EXPERIMENT", "D")
+
+_ABLATION_CONFIGS = {
+    "A": dict(multi_critic=False, payload_aware=False, load_aware=False,
+              weight_supervision=0.0, weight_smooth=0.0),
+    "B": dict(multi_critic=True, payload_aware=False, load_aware=False,
+              weight_supervision=0.0, weight_smooth=0.0),
+    "C": dict(multi_critic=True, payload_aware=True, load_aware=False,
+              weight_supervision=0.0, weight_smooth=0.0),
+    "D": dict(multi_critic=True, payload_aware=True, load_aware=True,
+              weight_supervision=1.0, weight_smooth=0.01),
+    "D1": dict(multi_critic=True, payload_aware=True, load_aware=True,
+               weight_supervision=1.0, weight_smooth=0.0),
+    "D2": dict(multi_critic=True, payload_aware=True, load_aware=True,
+               weight_supervision=0.0, weight_smooth=0.01),
+    "D3": dict(multi_critic=True, payload_aware=True, load_aware=True,
+               weight_supervision=1.0, weight_smooth=0.01),
+}
+if EXPERIMENT_MODE not in _ABLATION_CONFIGS:
+    raise ValueError(f"Unknown EXPERIMENT_MODE: {EXPERIMENT_MODE}")
+_ABLATION = _ABLATION_CONFIGS[EXPERIMENT_MODE]
 
 # =============================================================================
 # 章节开关：切换第三章 / 第四章的训练配置（改这一行即可）
@@ -52,7 +86,7 @@ _IK_OBS_DIM = 6 if (ARM_CONTROL_MODE == "ik_residual" and INCLUDE_IK_IN_OBS) els
 #   "explicit"  白盒前馈（上界参照）：把解析负载状态直接拼进底座观测
 # 负载状态 9 维 = 等效质心位置(3) + 重力力矩(3) + 质心速度(3)，均在 base 系
 # =============================================================================
-PAYLOAD_AWARENESS = "estimated"
+PAYLOAD_AWARENESS = "estimated" if _ABLATION["payload_aware"] else "none"
 
 _PAYLOAD_DIM = 9
 _PAYLOAD_OBS_DIM = _PAYLOAD_DIM if PAYLOAD_AWARENESS == "explicit" else 0
@@ -65,10 +99,29 @@ _PAYLOAD_PRIV_DIM = 0 if PAYLOAD_AWARENESS == "none" else _PAYLOAD_DIM
 # 奖励项通过 "组名__函数名" 的命名归组（如 stab__orientation）；无前缀的一律算 task，
 # 因此第三、四章现有的奖励配置无需改动。
 # =============================================================================
-MULTI_CRITIC = False
+MULTI_CRITIC = _ABLATION["multi_critic"]
 
 _VALUE_DIM = 3 if MULTI_CRITIC else 1
 REWARD_GROUPS = ("task", "stab", "energy")
+
+LOAD_AWARE_ENABLED = _ABLATION["load_aware"]
+LOAD_WEIGHT_HIDDEN_DIM = 64
+LOAD_WEIGHT_MIN = 0.05
+LOAD_WEIGHT_MAX = 0.90
+LOAD_WEIGHT_SMOOTH_COEF = _ABLATION["weight_smooth"]
+LOAD_WEIGHT_SUPERVISION_COEF = _ABLATION["weight_supervision"]
+PAYLOAD_LOSS_COEF = 1.0
+LOAD_RISK_POSITION_COEF = 1.0
+LOAD_RISK_TORQUE_COEF = 1.0
+LOAD_RISK_VELOCITY_COEF = 1.0
+LOAD_STAB_WEIGHT_MIN = 0.20
+LOAD_STAB_WEIGHT_MAX = 0.70
+LOAD_RISK_THRESHOLD = 0.5
+LOAD_RISK_SLOPE = 5.0
+TASK_ENERGY_RATIO = 0.8
+_POLICY_CLASS_NAME = (
+    "Actor_mulCritic_attention1" if MULTI_CRITIC else "ActorCritic"
+)
 
 
 class Go2ArmRoughCfg( LeggedRobotCfg ):
@@ -255,10 +308,14 @@ class Go2ArmRoughCfg( LeggedRobotCfg ):
             com_scale = 0.3                  # [m]
             torque_scale = 10.0              # [N·m]
             com_vel_scale = 1.0              # [m/s]
-            estimator_loss_coef = 1.0        # 黑盒估计的监督损失权重
+            estimator_loss_coef = PAYLOAD_LOSS_COEF
 
     class env(LeggedRobotCfg.env):
         num_envs = 4096
+        # Frozen base-policy history is independent from the arm policy history.
+        # The terrain-MoE base consumes 45 proprioceptive values over 20 frames.
+        base_policy_history_len = 20
+        base_policy_obs_dim = 45
         # dog 45 (+ 第二章白盒负载 9) + arm 30 (+ 第四章 IK 块 6)
         # 两个开关都关时为 75，布局与原来完全一致
         num_dog_one_step_observations = 45 + _PAYLOAD_OBS_DIM
@@ -352,32 +409,32 @@ class Go2ArmRoughCfg( LeggedRobotCfg ):
 
 
 
-            arm_manip_commands_tracking_combine = 3
+            task__arm_manip_commands_tracking_combine = 3
 
             # 精修项：窄 sigma 的 fine 跟踪奖励，只在接近目标时强烈起作用，
             # 弥补 combine（宽 exp）在目标附近梯度变平、推不动最后几 cm/度的问题。
             # 姿态是瓶颈轴，权重略高。
-            arm_pos_tracking_fine = 2.5   # sigma=0.03 m
-            arm_ori_tracking_fine = 3.5   # sigma=0.12 rad
+            task__arm_pos_tracking_fine = 2.5   # sigma=0.03 m
+            task__arm_ori_tracking_fine = 3.5   # sigma=0.12 rad
 
             # 事件驱动 settle bonus（一次性稀疏奖励，scale 会乘 dt=0.02，实际单次 +2.0）
-            arm_settle = 300
+            task__arm_settle = 300
             # PBRS 误差进展 shaping（gamma*phi' - phi，理论上不改变最优策略）
-            arm_pbrs_progress = 100
+            task__arm_pbrs_progress = 100
             # 臂动作与底座扰动的耦合惩罚（量级较大，从保守值起步，可逐步加强）
-            arm_base_coupling = -0.01
+            stab__arm_base_coupling = -0.01
 
             # 底座顺应残差幅度惩罚。仅在 arm.joint_finetune.enabled=True 时有意义；
             # 残差关闭时 dog_residual 恒为 0，此项恒零，故置 0 避免占用奖励槽与日志
             base_residual_penalty = 0.0
 
-            arm_action_rate = -0.01
+            energy__arm_action_rate = -0.01
             # arm_smoothness = -0.01
-            arm_energy = -1e-6
+            energy__arm_energy = -1e-6
             # arm_dof_vel = 0
-            arm_dof_acc = -1e-7
+            energy__arm_dof_acc = -1e-7
 
-            orientation = -0.2
+            stab__orientation = -0.2
             # tracking_lin_vel = 0.5
             # tracking_ang_vel = 0.2
             
@@ -407,14 +464,34 @@ class Go2ArmRoughCfgPPO( LeggedRobotCfgPPO ):
         entropy_coef = 0.01
         entropy_coef_final = 0.002
         entropy_anneal_start_frac = 0.25
-        # 多评论家：三路 advantage 的加权系数（value loss 也用同一组权重）
+        # 固定权重仅用于 B/C 消融的 advantage 融合；三个 value loss
+        # 始终独立计算，不参与动态负载权重。
         value_dim = _VALUE_DIM
         lambda_task = 0.7
         lambda_stab = 0.2
         lambda_energy = 0.1
+        load_aware_enabled = LOAD_AWARE_ENABLED
+        payload_loss_coef = PAYLOAD_LOSS_COEF
+        load_weight_supervision_coef = LOAD_WEIGHT_SUPERVISION_COEF
+        load_weight_smooth_coef = LOAD_WEIGHT_SMOOTH_COEF
+        load_gate_learning_rate = 3e-4
+        payload_learning_rate = 3e-4
+        load_risk_position_coef = LOAD_RISK_POSITION_COEF
+        load_risk_torque_coef = LOAD_RISK_TORQUE_COEF
+        load_risk_velocity_coef = LOAD_RISK_VELOCITY_COEF
+        load_stab_weight_min = LOAD_STAB_WEIGHT_MIN
+        load_stab_weight_max = LOAD_STAB_WEIGHT_MAX
+        load_risk_threshold = LOAD_RISK_THRESHOLD
+        load_risk_slope = LOAD_RISK_SLOPE
+        task_energy_ratio = TASK_ENERGY_RATIO
+    class policy( LeggedRobotCfgPPO.policy ):
+        load_aware_enabled = LOAD_AWARE_ENABLED
+        load_weight_hidden_dim = LOAD_WEIGHT_HIDDEN_DIM
+        load_weight_min = LOAD_WEIGHT_MIN
+        load_weight_max = LOAD_WEIGHT_MAX
     class runner( LeggedRobotCfgPPO.runner ):
         empirical_normalization = True
-        policy_class_name = 'ActorCritic'
+        policy_class_name = _POLICY_CLASS_NAME
         algorithm_class_name = 'HIMPPO'
         num_steps_per_env = 24 # per iteration
         max_iterations = 8000 # number of policy updates
@@ -424,10 +501,52 @@ class Go2ArmRoughCfgPPO( LeggedRobotCfgPPO ):
         experiment_name = 'test'
         run_name = 'baseline'
         use_frozen_base_policy = True
-        base_policy_path = "/workspace/manipulation/legged_gym/logs/go2_arm/baseline/model_16500.pt"
-        base_empirical_normalization = True
-        # 冻结底座 checkpoint 训练时用的 payload_dim（第二章开关）。现有的
-        # model_16500.pt 是无负载感知时训的，故为 0；换用带负载感知的第二章新权重后改成 9
+        base_policy_class_name = "TerrainMoeActorCritic"
+        base_policy_path = os.path.join(
+            LEGGED_GYM_ROOT_DIR,
+            "base_policies",
+            "go2_terrain_moe_tcn_gate",
+            "model_14999.pt",
+        )
+        base_policy_architecture_version = (
+            "go2_terrain_moe_v3_mlp_temporal_tcn_gate"
+        )
+        base_policy_history_len = 20
+        base_policy_obs_dim = 45
+        base_policy_num_privileged_obs = 242
+        base_empirical_normalization = False
+        # Legacy actor policy compatibility. Terrain-MoE has its own predictive
+        # perception path and does not consume this payload input dimension.
         base_policy_payload_dim = 0
 
-  
+        class base_policy:
+            num_modes = 4
+            latent_dim = 32
+            expert_hidden_dims = (256, 128, 64)
+            actor_hidden_dims = (512, 256, 128)
+            critic_hidden_dims = (512, 256, 128)
+            gate_hidden_dims = (64, 64)
+            dynamics_target_dim = 30
+            contact_dim = 4
+            future_contact_steps = 15
+            terrain_dim = 187
+            activation = "elu"
+            init_noise_std = 0.8
+            ema_tau = 0.01
+            gate_rho = 0.3
+            gate_type = "temporal_tcn"
+            gate_tcn_channels = 32
+            gate_tcn_layers = 2
+            gate_temporal_dim = 32
+            gate_kernel_size = 3
+            gate_output_norm = False
+            gate_balance_coef = 0.0
+            use_auxiliary_loss = True
+            train_perception_with_ppo = False
+            use_ema = True
+            history_encoder = "mlp"
+            history_encoder_hidden_dims = (64, 64, 64)
+            tcn_width = 192
+            tcn_layers = 3
+            velocity_hidden_dims = (128, 64)
+            adapter_hidden_dims = (64,)

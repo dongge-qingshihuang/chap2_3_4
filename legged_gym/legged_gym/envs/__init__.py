@@ -35,6 +35,11 @@ from .a1.a1_config import A1RoughCfg, A1RoughCfgPPO
 from legged_gym.envs.go1.go1_config import Go1RoughCfg, Go1RoughCfgPPO
 from legged_gym.envs.aliengo.aliengo_config import AlienGoRoughCfg, AlienGoRoughCfgPPO
 from legged_gym.envs.go2.go2_config import Go2RoughCfg, Go2RoughCfgPPO
+from legged_gym.envs.go2.go2_terrain_moe_config import (
+    Go2TerrainMoeTemporalGateCfg,
+    Go2TerrainMoeTemporalGateCfgPPO,
+)
+from legged_gym.envs.go2.go2_terrain_moe_env import Go2TerrainMoeEnv
 from legged_gym.envs.go2_arm.go2_arm_config import Go2ArmRoughCfg, Go2ArmRoughCfgPPO
 from legged_gym.envs.go2_arm.go2_arm_env import Go2ArmEnv
 
@@ -46,4 +51,10 @@ task_registry.register( "a1", LeggedRobot, A1RoughCfg(), A1RoughCfgPPO() )
 task_registry.register( "go1", LeggedRobot, Go1RoughCfg(), Go1RoughCfgPPO() )
 task_registry.register( "aliengo", LeggedRobot, AlienGoRoughCfg(), AlienGoRoughCfgPPO() )
 task_registry.register( "go2", LeggedRobot, Go2RoughCfg(), Go2RoughCfgPPO() )
+task_registry.register(
+    "go2_terrain_moe_tcn_gate",
+    Go2TerrainMoeEnv,
+    Go2TerrainMoeTemporalGateCfg(),
+    Go2TerrainMoeTemporalGateCfgPPO(),
+)
 task_registry.register( "go2_arm", Go2ArmEnv, Go2ArmRoughCfg(), Go2ArmRoughCfgPPO() )

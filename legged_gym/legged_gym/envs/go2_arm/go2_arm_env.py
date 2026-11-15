@@ -931,9 +931,43 @@ class Go2ArmEnv(BaseTask):
         self.obj_quats[env_ids] = q.reshape(-1, 4)
 
     def get_dog_observations(self):
-        obs_hist = self.obs_buf.view(self.num_envs, self.cfg.env.num_hist, self.num_one_step_obs)
-        dog_hist = obs_hist[:, :, :self.num_dog_one_step_obs]
+        """Return the frozen base policy's independent proprioceptive history."""
+        dog_hist = torch.stack(
+            [self.dog_obs_history[index]
+             for index in range(self.dog_obs_history.maxlen)],
+            dim=1,
+        )
         return dog_hist.reshape(self.num_envs, -1)
+
+    def configure_base_policy_observation(self, history_len, obs_dim):
+        """Configure the base policy history without changing the arm history.
+
+        The terrain-MoE base was trained on 45 proprioceptive values over 20
+        frames, while the arm policy intentionally keeps its six-frame layout.
+        """
+        history_len = int(history_len)
+        obs_dim = int(obs_dim)
+        if history_len < 1 or obs_dim < 1:
+            raise ValueError(
+                f"Invalid base policy observation shape: {history_len}x{obs_dim}"
+            )
+        if obs_dim > self.num_dog_one_step_obs:
+            raise ValueError(
+                f"Base policy obs_dim={obs_dim} exceeds dog observation "
+                f"dimension {self.num_dog_one_step_obs}"
+            )
+        self.base_policy_history_len = history_len
+        self.base_policy_obs_dim = obs_dim
+        self.dog_obs_history = deque(maxlen=history_len)
+        for _ in range(history_len):
+            self.dog_obs_history.append(
+                torch.zeros(
+                    self.num_envs,
+                    obs_dim,
+                    dtype=torch.float,
+                    device=self.device,
+                )
+            )
 
     def _dog_obs_block(self):
         """底座本体观测块。第二章白盒模式下在尾部追加解析负载状态；
@@ -1338,6 +1372,9 @@ class Go2ArmEnv(BaseTask):
 
         for i in range(self.obs_history.maxlen):
             self.obs_history[i][env_ids] *= 0
+        if hasattr(self, "dog_obs_history"):
+            for frame in self.dog_obs_history:
+                frame[env_ids] *= 0
 
         self.episode_length_buf[env_ids] = 0
     
@@ -1403,6 +1440,11 @@ class Go2ArmEnv(BaseTask):
         if self.add_noise:
             current_obs += (2 * torch.rand_like(current_obs) - 1) * self.noise_scale_vec[:current_obs.shape[1]]
 
+        # The base policy has its own history length. Keep the arm history at
+        # num_hist while supplying the frozen base with its original window.
+        self.dog_obs_history.append(
+            current_obs[:, :self.base_policy_obs_dim]
+        )
         self.obs_history.append(current_obs)
         obs_history = torch.stack([self.obs_history[i] for i in range(self.obs_history.maxlen)], dim=1)
         self.obs_buf = obs_history.reshape(self.num_envs, -1)
@@ -2366,6 +2408,14 @@ class Go2ArmEnv(BaseTask):
         self.obs_history = deque(maxlen=self.cfg.env.num_hist)
         for _ in range(self.cfg.env.num_hist):
             self.obs_history.append(torch.zeros(self.num_envs, self.cfg.env.num_one_step_observations,dtype=torch.float, device=self.device))
+        self.configure_base_policy_observation(
+            getattr(
+                self.cfg.env,
+                "base_policy_history_len",
+                self.cfg.env.num_hist,
+            ),
+            getattr(self.cfg.env, "base_policy_obs_dim", 45),
+        )
 
 
     def _prepare_reward_function(self):
@@ -2415,10 +2465,15 @@ class Go2ArmEnv(BaseTask):
         # 多评论家下空组会让对应的 critic 恒学 V=0、该路 advantage 恒为 0，
         # 等于白白多了一个头却没起作用——这种配置几乎肯定是忘了给奖励加组前缀
         if self.value_dim > 1:
+            empty_groups = []
             for gi, gname in enumerate(self.reward_groups[:self.value_dim]):
                 if gi not in self.reward_group_idx:
-                    print(f"[Reward] 警告：'{gname}' 组没有任何奖励项，该 critic 头将恒为 0。"
-                          f"多评论家需要把奖励按 '{gname}__函数名' 归组")
+                    empty_groups.append(gname)
+            if empty_groups:
+                raise ValueError(
+                    "Multi-critic reward groups must be non-empty; missing "
+                    f"{empty_groups}. Prefix rewards with '<group>__<name>'."
+                )
 
     def _create_ground_plane(self):
         """ Adds a ground plane to the simulation, sets friction and restitution based on the cfg.

@@ -44,6 +44,11 @@ from rsl_rl.modules import ActorCritic_attention1
 from rsl_rl.modules import ActorCriticArmServo
 from rsl_rl.modules import ActorCriticArmServoDogPrior
 from rsl_rl.modules import ActorCritic
+from rsl_rl.modules import (
+    payload_prediction_errors,
+    physical_prior_weights,
+    weight_entropy,
+)
 
 class HIMPPO:
     actor_critic: ActorCriticArmServoDogPrior
@@ -69,6 +74,20 @@ class HIMPPO:
                  lambda_task=0.7,
                  lambda_stab=0.2,
                  lambda_energy=0.1,
+                 load_aware_enabled=False,
+                 payload_loss_coef=1.0,
+                 load_weight_supervision_coef=1.0,
+                 load_weight_smooth_coef=0.01,
+                 load_gate_learning_rate=3e-4,
+                 payload_learning_rate=3e-4,
+                 load_risk_position_coef=1.0,
+                 load_risk_torque_coef=1.0,
+                 load_risk_velocity_coef=1.0,
+                 load_stab_weight_min=0.20,
+                 load_stab_weight_max=0.70,
+                 load_risk_threshold=0.5,
+                 load_risk_slope=5.0,
+                 task_energy_ratio=0.8,
                  ):
 
         self.device = device
@@ -82,7 +101,6 @@ class HIMPPO:
         self.actor_critic = actor_critic
         self.actor_critic.to(self.device)
         self.storage = None # initialized later
-        self.optimizer = optim.Adam(self.actor_critic.parameters(), lr=learning_rate)
         self.transition = HIMRolloutStorage.Transition()
 
         # PPO parameters
@@ -107,13 +125,64 @@ class HIMPPO:
             self.value_weights = torch.tensor(
                 [lambda_task, lambda_stab, lambda_energy][:self.value_dim], device=self.device
             )
+            self.value_weights = self.value_weights / self.value_weights.sum()
         else:
             self.value_weights = None
+
+        self.load_aware_enabled = bool(load_aware_enabled)
+        self.load_weight_supervision_coef = float(
+            load_weight_supervision_coef
+        )
+        self.load_weight_smooth_coef = float(load_weight_smooth_coef)
+        self.load_risk_position_coef = float(load_risk_position_coef)
+        self.load_risk_torque_coef = float(load_risk_torque_coef)
+        self.load_risk_velocity_coef = float(load_risk_velocity_coef)
+        self.load_stab_weight_min = float(load_stab_weight_min)
+        self.load_stab_weight_max = float(load_stab_weight_max)
+        self.load_risk_threshold = float(load_risk_threshold)
+        self.load_risk_slope = float(load_risk_slope)
+        self.task_energy_ratio = float(task_energy_ratio)
+        self.last_update_stats = {}
+
+        ppo_parameters = (
+            actor_critic.ppo_parameters()
+            if hasattr(actor_critic, "ppo_parameters")
+            else actor_critic.parameters()
+        )
+        self.optimizer = optim.Adam(ppo_parameters, lr=learning_rate)
+        payload_parameters = (
+            actor_critic.payload_parameters()
+            if hasattr(actor_critic, "payload_parameters")
+            else []
+        )
+        self.payload_optimizer = (
+            optim.Adam(payload_parameters, lr=payload_learning_rate)
+            if payload_parameters
+            else None
+        )
+        load_gate_parameters = (
+            actor_critic.load_gate_parameters()
+            if hasattr(actor_critic, "load_gate_parameters")
+            else []
+        )
+        self.load_gate_optimizer = (
+            optim.Adam(load_gate_parameters, lr=load_gate_learning_rate)
+            if load_gate_parameters
+            else None
+        )
+        if self.load_aware_enabled and self.load_gate_optimizer is None:
+            raise ValueError(
+                "load_aware_enabled=True requires an actor load-weight network"
+            )
+        if self.load_aware_enabled and self.value_dim != 3:
+            raise ValueError(
+                "load-aware advantage fusion requires three critics"
+            )
 
         # --- 第二章负载感知：黑盒估计器的监督（特权真值 -> ProprioEncoder 预测）---
         # 由 runner 从 env 写入；None 表示未启用
         self.payload_slice = None
-        self.payload_loss_coef = 1.0
+        self.payload_loss_coef = float(payload_loss_coef)
 
         # --- 底座顺应残差（联合 fine-tune）---
         self.base_residual = None
@@ -144,7 +213,7 @@ class HIMPPO:
                                          value_dim=self.value_dim)
 
     def test_mode(self):
-        self.actor_critic.test()
+        self.actor_critic.eval()
     
     def train_mode(self):
         self.actor_critic.train()
@@ -156,6 +225,33 @@ class HIMPPO:
         self.transition.actions_log_prob = self.actor_critic.get_actions_log_prob(self.transition.actions).detach()
         self.transition.action_mean = self.actor_critic.action_mean.detach()
         self.transition.action_sigma = self.actor_critic.action_std.detach()
+        if self.value_dim > 1:
+            get_payload = getattr(
+                self.actor_critic, "get_payload_estimate", None
+            )
+            get_weights = getattr(
+                self.actor_critic, "get_load_weights", None
+            )
+            payload_prediction = (
+                get_payload() if get_payload is not None else None
+            )
+            load_weights = (
+                get_weights() if get_weights is not None else None
+            )
+            self.transition.payload_predictions = (
+                payload_prediction.detach()
+                if payload_prediction is not None
+                else None
+            )
+            self.transition.load_weights = (
+                load_weights.detach()
+                if load_weights is not None
+                else None
+            )
+            if self.load_aware_enabled and self.transition.load_weights is None:
+                raise RuntimeError(
+                    "Load-aware rollout did not produce fusion weights"
+                )
         # need to record obs and critic_obs before env.step()
         self.transition.observations = obs
         self.transition.critic_observations = critic_obs
@@ -190,6 +286,8 @@ class HIMPPO:
     def compute_returns(self, last_critic_obs):
         last_values= self.actor_critic.evaluate(last_critic_obs).detach()
         self.storage.compute_returns(last_values, self.gamma, self.lam)
+        if self.value_dim > 1:
+            self.storage.compute_fused_advantages(self.value_weights)
 
     @staticmethod
     def _anneal_linear(it, total_it, init_val, final_val, start_frac):
@@ -220,8 +318,33 @@ class HIMPPO:
     def update_simple(self):
         mean_value_loss = 0.0
         mean_surrogate_loss = 0.0
-        mean_estimation_loss = 0.0   # simple ActorCritic 没 estimator，这里占位返回 0
-        mean_swap_loss = 0.0         # simple ActorCritic 没 swap loss，这里占位返回 0
+        mean_estimation_loss = 0.0
+        mean_gate_loss = 0.0
+        updates = 0
+        ppo_grad_norm = 0.0
+        payload_grad_norm = 0.0
+        gate_grad_norm = 0.0
+        value_loss_sums = torch.zeros(self.value_dim, device=self.device)
+        return_sums = torch.zeros(self.value_dim, device=self.device)
+        advantage_std_sums = torch.zeros(self.value_dim, device=self.device)
+        payload_error_sums = {
+            key: 0.0
+            for key in ("total", "position", "torque", "velocity")
+        }
+        predicted_weight_sums = torch.zeros(3, device=self.device)
+        predicted_weight_sq_sums = torch.zeros(3, device=self.device)
+        prior_weight_sums = torch.zeros(3, device=self.device)
+        actual_weight_sums = torch.zeros(3, device=self.device)
+        actual_weight_sq_sums = torch.zeros(3, device=self.device)
+        weight_entropy_sum = 0.0
+        weight_change_sum = 0.0
+        weight_change_count = 0
+        weight_kl_sum = 0.0
+        weight_smooth_sum = 0.0
+        risk_sums = {
+            key: 0.0
+            for key in ("risk", "position", "torque", "velocity")
+        }
 
         generator = self.storage.mini_batch_generator(
             self.num_mini_batches,
@@ -235,10 +358,15 @@ class HIMPPO:
             next_critic_obs_batch,
             target_values_batch,
             advantages_batch,
+            fused_advantages_batch,
             returns_batch,
             old_actions_log_prob_batch,
             old_mu_batch,
             old_sigma_batch,
+            load_weights_batch,
+            previous_load_weights_batch,
+            load_weight_smooth_mask_batch,
+            payload_predictions_batch,
             base_batch
         ) in generator:
 
@@ -277,11 +405,10 @@ class HIMPPO:
             # 3) PPO surrogate loss
             ratio = torch.exp(actions_log_prob_batch - old_actions_log_prob_batch.squeeze(-1))
             if self.value_dim > 1:
-                # 各头 advantage 已在 storage 中分别标准化，这里按 λ 加权成标量。
-                # 末尾再归一化一次，使结果只取决于 λ 的比例、与其整体缩放无关，
-                # advantage 尺度也和单评论家一致（clip / 学习率行为可比）
-                adv = (advantages_batch * self.value_weights.unsqueeze(0)).sum(dim=-1)
-                adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+                # Rollout-time weights are fixed targets for this PPO update.
+                # They are detached and therefore cannot be optimized through
+                # the actor loss.
+                adv = fused_advantages_batch.squeeze(-1).detach()
             else:
                 adv = advantages_batch.squeeze(-1)
 
@@ -293,7 +420,8 @@ class HIMPPO:
             )
             surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
 
-            # 4) value loss（多评论家时各头分别算，再按同一组 λ 加权求和）
+            # 4) Independent critic losses. Dynamic load weights affect only
+            # advantage fusion, never the value-regression objective.
             if self.use_clipped_value_loss:
                 value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(
                     -self.clip_param, self.clip_param
@@ -305,56 +433,152 @@ class HIMPPO:
                 vl = (returns_batch - value_batch).pow(2)
 
             if self.value_dim > 1:
-                value_loss = (vl * self.value_weights.unsqueeze(0)).sum(dim=-1).mean()
+                value_loss_vector = vl.mean(dim=0)
+                value_loss = value_loss_vector.mean()
             else:
                 value_loss = vl.mean()
+                value_loss_vector = value_loss.reshape(1)
 
-            # 5) total loss
-            aux_loss = torch.zeros((), device=self.device)
-            arm_delta_loss = torch.zeros((), device=self.device)
-            zero_loss = torch.zeros((), device=self.device)
-
-            # aux_loss, arm_delta_loss, zero_loss = self.actor_critic.auxiliary_loss(
-            #     obs_batch,
-            #     actions_batch,
-            #     critic_obs_batch,
-            #     next_critic_obs_batch,
-            # )
-
-            # 第二章：负载状态估计的监督损失。ProprioEncoder 只看本体观测，
-            # 用特权通道里的解析真值做回归，使部署时无需臂编码器即可获得负载感知
-            payload_loss = torch.zeros((), device=self.device)
-            prop_encoder = getattr(self.actor_critic, "prop_encoder", None)
-            if self.payload_slice is not None and hasattr(prop_encoder, "forward_full"):
-                _, _, payload_pred = prop_encoder.forward_full(obs_batch)
-                if payload_pred is not None:
-                    payload_target = critic_obs_batch[:, self.payload_slice].detach()
-                    payload_loss = F.mse_loss(payload_pred, payload_target)
-
-            aux_loss = 0
+            # 5) PPO loss
             loss = (
                 surrogate_loss
                 + self.value_loss_coef * value_loss
                 - self.entropy_coef * entropy_batch.mean()
-                + self.aux_loss_coef * aux_loss
-                + self.payload_loss_coef * payload_loss
             )
 
             # 6) optimize
-            self.optimizer.zero_grad()
+            self.optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
+            ppo_grad_norm += nn.utils.clip_grad_norm_(
+                self.optimizer.param_groups[0]["params"],
+                self.max_grad_norm,
+            ).item()
             self.optimizer.step()
 
-            # log_std 参数投影：把参数本身夹回 [log(1e-4), log(0.5)]。
-            # 若只在 std 属性里 clamp 输出，log_std 一旦越过上限梯度即为零，
-            # std 会永久钉死在上限（吸收态），熵系数调多小都无法恢复。
-            # 区间需与 actor_critic 中 std 属性的 clamp 范围保持一致。
             if hasattr(self.actor_critic, "log_std"):
                 with torch.no_grad():
                     self.actor_critic.log_std.clamp_(math.log(1e-4), math.log(0.5))
 
-            # 7) 底座顺应残差更新（共享 advantage，独立 optimizer + 低 LR）
+            # 7) Payload supervision with a dedicated optimizer. The actor
+            # consumes detached estimates, so this loss cannot update policy
+            # or critic parameters.
+            payload_prediction = None
+            payload_target = None
+            payload_loss = torch.zeros((), device=self.device)
+            prop_encoder = getattr(self.actor_critic, "prop_encoder", None)
+            if (
+                self.payload_slice is not None
+                and self.payload_optimizer is not None
+                and hasattr(prop_encoder, "forward_full")
+            ):
+                _, _, payload_prediction = prop_encoder.forward_full(obs_batch)
+                if payload_prediction is not None:
+                    payload_target = critic_obs_batch[:, self.payload_slice].detach()
+                    payload_errors = payload_prediction_errors(
+                        payload_prediction, payload_target
+                    )
+                    payload_loss = (
+                        self.payload_loss_coef * payload_errors["total"]
+                    )
+                    self.payload_optimizer.zero_grad(set_to_none=True)
+                    payload_loss.backward()
+                    payload_grad_norm += nn.utils.clip_grad_norm_(
+                        self.payload_optimizer.param_groups[0]["params"],
+                        self.max_grad_norm,
+                    ).item()
+                    self.payload_optimizer.step()
+                    for key, value in payload_errors.items():
+                        payload_error_sums[key] += value.item()
+
+            # 8) Load-weight supervision. Gate inputs and previous weights are
+            # detached; only the gate MLP receives gradients.
+            gate_loss = torch.zeros((), device=self.device)
+            if (
+                self.load_aware_enabled
+                and self.load_gate_optimizer is not None
+                and payload_prediction is not None
+                and payload_target is not None
+            ):
+                predicted_weights, _, _ = self.actor_critic.load_weight_net(
+                    payload_prediction.detach(), return_logits=True
+                )
+                prior = physical_prior_weights(
+                    payload_target,
+                    stability_min=self.load_stab_weight_min,
+                    stability_max=self.load_stab_weight_max,
+                    risk_threshold=self.load_risk_threshold,
+                    risk_slope=self.load_risk_slope,
+                    task_energy_ratio=self.task_energy_ratio,
+                    position_coef=self.load_risk_position_coef,
+                    torque_coef=self.load_risk_torque_coef,
+                    velocity_coef=self.load_risk_velocity_coef,
+                )
+                prior_weights = prior["weights"].detach()
+                supervision_loss = (
+                    prior_weights
+                    * (
+                        prior_weights.clamp_min(1e-8).log()
+                        - predicted_weights.clamp_min(1e-8).log()
+                    )
+                ).sum(dim=-1).mean()
+                smooth_errors = (
+                    predicted_weights - previous_load_weights_batch.detach()
+                ).pow(2).sum(dim=-1, keepdim=True)
+                smooth_mask = load_weight_smooth_mask_batch
+                smooth_loss = (
+                    (smooth_errors * smooth_mask).sum()
+                    / smooth_mask.sum().clamp_min(1.0)
+                )
+                gate_loss = (
+                    self.load_weight_supervision_coef * supervision_loss
+                    + self.load_weight_smooth_coef * smooth_loss
+                )
+                self.load_gate_optimizer.zero_grad(set_to_none=True)
+                gate_loss.backward()
+                gate_grad_norm += nn.utils.clip_grad_norm_(
+                    self.load_gate_optimizer.param_groups[0]["params"],
+                    self.max_grad_norm,
+                ).item()
+                self.load_gate_optimizer.step()
+                weight_change_sum += (
+                    (smooth_errors.detach() * smooth_mask)
+                    .sum()
+                    .item()
+                )
+                weight_kl_sum += supervision_loss.item()
+                weight_smooth_sum += smooth_loss.item()
+                weight_change_count += int(smooth_mask.sum().item())
+                predicted_weight_sums += predicted_weights.mean(dim=0).detach()
+                predicted_weight_sq_sums += predicted_weights.pow(2).mean(
+                    dim=0
+                ).detach()
+                prior_weight_sums += prior_weights.mean(dim=0)
+                weight_entropy_sum += weight_entropy(
+                    predicted_weights.detach()
+                ).mean().item()
+                for key in risk_sums:
+                    risk_sums[key] += prior[key].mean().item()
+
+            if load_weights_batch is not None:
+                actual_weights = load_weights_batch
+                actual_weight_sums += actual_weights.mean(dim=0)
+                actual_weight_sq_sums += actual_weights.pow(2).mean(dim=0)
+            elif self.value_dim > 1:
+                actual_weights = self.value_weights.unsqueeze(0).expand(
+                    actions_batch.size(0), -1
+                )
+                actual_weight_sums += actual_weights.mean(dim=0)
+                actual_weight_sq_sums += actual_weights.pow(2).mean(dim=0)
+
+            value_loss_sums += value_loss_vector.detach()
+            return_sums += returns_batch.mean(dim=0).detach()
+            advantage_std_sums += advantages_batch.std(dim=0).detach()
+            mean_value_loss += value_loss.item()
+            mean_surrogate_loss += surrogate_loss.item()
+            mean_estimation_loss += payload_loss.item()
+            mean_gate_loss += gate_loss.item()
+
+            # 9) 底座顺应残差更新（共享融合 advantage，独立 optimizer）
             if self.train_base and base_batch[0] is not None:
                 base_obs_batch, base_actions_batch, base_old_logp_batch, _, _ = base_batch
 
@@ -378,16 +602,99 @@ class HIMPPO:
                 with torch.no_grad():
                     self.base_residual.log_std.clamp_(math.log(1e-4), math.log(self.base_log_std_max))
 
-            mean_value_loss += value_loss.item()
-            mean_surrogate_loss += surrogate_loss.item()
-            # mean_estimation_loss += aux_loss.item()
+            updates += 1
 
-        num_updates = self.num_learning_epochs * self.num_mini_batches
-        mean_value_loss /= num_updates
-        mean_surrogate_loss /= num_updates
-        # mean_estimation_loss /= num_updates
-        mean_swap_loss /= num_updates
+        updates = max(updates, 1)
+        mean_value_loss /= updates
+        mean_surrogate_loss /= updates
+        mean_estimation_loss /= updates
+        mean_gate_loss /= updates
+        value_loss_sums /= updates
+        return_sums /= updates
+        advantage_std_sums /= updates
+        for key in payload_error_sums:
+            payload_error_sums[key] /= updates
+
+        self.last_update_stats = {
+            "surrogate_loss": mean_surrogate_loss,
+            "value_loss": mean_value_loss,
+            "payload_loss": mean_estimation_loss,
+            "gate_loss": mean_gate_loss,
+            "ppo_grad_norm": ppo_grad_norm / updates,
+            "payload_grad_norm": payload_grad_norm / updates,
+            "gate_grad_norm": gate_grad_norm / updates,
+        }
+        for index in range(self.value_dim):
+            self.last_update_stats[
+                f"critic_value_loss_{index}"
+            ] = value_loss_sums[index].item()
+            self.last_update_stats[
+                f"critic_return_{index}"
+            ] = return_sums[index].item()
+            self.last_update_stats[
+                f"critic_advantage_std_{index}"
+            ] = advantage_std_sums[index].item()
+        for key, value in payload_error_sums.items():
+            self.last_update_stats[f"payload_{key}_mse"] = value
+        if self.value_dim > 1 and not self.load_aware_enabled:
+            actual_weight_mean = actual_weight_sums / updates
+            actual_weight_std = (
+                actual_weight_sq_sums / updates
+                - actual_weight_mean.pow(2)
+            ).clamp_min(0.0).sqrt()
+            for index, name in enumerate(("task", "stability", "energy")):
+                self.last_update_stats[
+                    f"actual_{name}_weight"
+                ] = actual_weight_mean[index].item()
+                self.last_update_stats[
+                    f"actual_{name}_weight_std"
+                ] = actual_weight_std[index].item()
+        if self.load_aware_enabled:
+            predicted_weight_mean = predicted_weight_sums / updates
+            predicted_weight_std = (
+                predicted_weight_sq_sums / updates
+                - predicted_weight_mean.pow(2)
+            ).clamp_min(0.0).sqrt()
+            prior_weight_mean = prior_weight_sums / updates
+            actual_weight_mean = actual_weight_sums / updates
+            actual_weight_std = (
+                actual_weight_sq_sums / updates
+                - actual_weight_mean.pow(2)
+            ).clamp_min(0.0).sqrt()
+            for index, name in enumerate(("task", "stability", "energy")):
+                self.last_update_stats[
+                    f"predicted_{name}_weight"
+                ] = predicted_weight_mean[index].item()
+                self.last_update_stats[
+                    f"predicted_{name}_weight_std"
+                ] = predicted_weight_std[index].item()
+                self.last_update_stats[
+                    f"prior_{name}_weight"
+                ] = prior_weight_mean[index].item()
+                self.last_update_stats[
+                    f"actual_{name}_weight"
+                ] = actual_weight_mean[index].item()
+                self.last_update_stats[
+                    f"actual_{name}_weight_std"
+                ] = actual_weight_std[index].item()
+            self.last_update_stats["weight_entropy"] = (
+                weight_entropy_sum / updates
+            )
+            self.last_update_stats["weight_change_norm"] = (
+                weight_change_sum / max(weight_change_count, 1)
+            )
+            self.last_update_stats["weight_kl"] = weight_kl_sum / updates
+            self.last_update_stats["weight_smooth_loss"] = (
+                weight_smooth_sum / updates
+            )
+            for key, value in risk_sums.items():
+                self.last_update_stats[f"risk_{key}"] = value / updates
 
         self.storage.clear()
 
-        return mean_value_loss, mean_surrogate_loss, mean_estimation_loss, mean_swap_loss
+        return (
+            mean_value_loss,
+            mean_surrogate_loss,
+            mean_estimation_loss,
+            mean_gate_loss,
+        )

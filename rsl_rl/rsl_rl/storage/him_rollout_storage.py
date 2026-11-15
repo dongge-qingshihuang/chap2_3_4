@@ -46,6 +46,8 @@ class HIMRolloutStorage:
             self.action_mean = None
             self.action_sigma = None
             self.next_critic_observations = None
+            self.payload_predictions = None
+            self.load_weights = None
             # --- 底座顺应残差（联合 fine-tune 时使用，共享 critic/advantage）---
             self.base_observations = None
             self.base_actions = None
@@ -93,8 +95,25 @@ class HIMRolloutStorage:
         self.values = torch.zeros(num_transitions_per_env, num_envs, value_dim, device=self.device)
         self.returns = torch.zeros(num_transitions_per_env, num_envs, value_dim, device=self.device)
         self.advantages = torch.zeros(num_transitions_per_env, num_envs, value_dim, device=self.device)
+        self.fused_advantages = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
         self.mu = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
         self.sigma = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
+        if value_dim > 1:
+            self.payload_predictions = torch.zeros(
+                num_transitions_per_env, num_envs, 9, device=self.device
+            )
+            self.load_weights = torch.zeros(
+                num_transitions_per_env, num_envs, value_dim, device=self.device
+            )
+            self.previous_load_weights = torch.zeros_like(self.load_weights)
+            self.load_weight_smooth_mask = torch.zeros(
+                num_transitions_per_env, num_envs, 1, device=self.device
+            )
+        else:
+            self.payload_predictions = None
+            self.load_weights = None
+            self.previous_load_weights = None
+            self.load_weight_smooth_mask = None
 
         self.num_transitions_per_env = num_transitions_per_env
         self.num_envs = num_envs
@@ -114,6 +133,25 @@ class HIMRolloutStorage:
         self.actions_log_prob[self.step].copy_(transition.actions_log_prob.view(-1, 1))
         self.mu[self.step].copy_(transition.action_mean)
         self.sigma[self.step].copy_(transition.action_sigma)
+        if self.load_weights is not None:
+            if transition.load_weights is not None:
+                self.load_weights[self.step].copy_(transition.load_weights)
+                if self.step == 0:
+                    self.previous_load_weights[self.step].copy_(
+                        transition.load_weights
+                    )
+                    self.load_weight_smooth_mask[self.step].zero_()
+                else:
+                    self.previous_load_weights[self.step].copy_(
+                        self.load_weights[self.step - 1]
+                    )
+                    self.load_weight_smooth_mask[self.step].copy_(
+                        1.0 - self.dones[self.step - 1].float()
+                    )
+            if transition.payload_predictions is not None:
+                self.payload_predictions[self.step].copy_(
+                    transition.payload_predictions
+                )
         if self.store_base:
             self.base_observations[self.step].copy_(transition.base_observations)
             self.base_actions[self.step].copy_(transition.base_actions)
@@ -145,6 +183,28 @@ class HIMRolloutStorage:
         std = self.advantages.std(dim=(0, 1), keepdim=True)
         self.advantages = (self.advantages - mean) / (std + 1e-8)
 
+    def compute_fused_advantages(self, fallback_weights=None):
+        """Fuse normalized critic advantages with rollout-time weights."""
+        if self.value_dim == 1:
+            self.fused_advantages = self.advantages
+            return self.fused_advantages
+        if self.load_weights is not None and self.load_weights.abs().sum() > 0:
+            weights = self.load_weights
+        elif fallback_weights is not None:
+            weights = fallback_weights.to(self.device).view(1, 1, -1)
+            weights = weights.expand(
+                self.num_transitions_per_env, self.num_envs, -1
+            )
+        else:
+            raise RuntimeError(
+                "Multi-critic advantage fusion requires load weights or "
+                "fallback critic weights"
+            )
+        self.fused_advantages = (
+            self.advantages * weights
+        ).sum(dim=-1, keepdim=True)
+        return self.fused_advantages
+
     def get_statistics(self):
         done = self.dones
         done[-1] = 1
@@ -171,8 +231,19 @@ class HIMRolloutStorage:
         returns = self.returns.flatten(0, 1)
         old_actions_log_prob = self.actions_log_prob.flatten(0, 1)
         advantages = self.advantages.flatten(0, 1)
+        fused_advantages = self.fused_advantages.flatten(0, 1)
         old_mu = self.mu.flatten(0, 1)
         old_sigma = self.sigma.flatten(0, 1)
+        if self.load_weights is not None:
+            load_weights = self.load_weights.flatten(0, 1)
+            previous_load_weights = self.previous_load_weights.flatten(0, 1)
+            load_weight_smooth_mask = self.load_weight_smooth_mask.flatten(0, 1)
+            payload_predictions = self.payload_predictions.flatten(0, 1)
+        else:
+            load_weights = None
+            previous_load_weights = None
+            load_weight_smooth_mask = None
+            payload_predictions = None
 
         if self.store_base:
             base_observations = self.base_observations.flatten(0, 1)
@@ -198,6 +269,17 @@ class HIMRolloutStorage:
                 advantages_batch = advantages[batch_idx]
                 old_mu_batch = old_mu[batch_idx]
                 old_sigma_batch = old_sigma[batch_idx]
+                fused_advantages_batch = fused_advantages[batch_idx]
+                if load_weights is not None:
+                    load_weights_batch = load_weights[batch_idx]
+                    previous_load_weights_batch = previous_load_weights[batch_idx]
+                    load_weight_smooth_mask_batch = load_weight_smooth_mask[batch_idx]
+                    payload_predictions_batch = payload_predictions[batch_idx]
+                else:
+                    load_weights_batch = None
+                    previous_load_weights_batch = None
+                    load_weight_smooth_mask_batch = None
+                    payload_predictions_batch = None
 
                 if self.store_base:
                     base_batch = (
@@ -210,5 +292,21 @@ class HIMRolloutStorage:
                 else:
                     base_batch = (None, None, None, None, None)
 
-                yield obs_batch, critic_observations_batch, actions_batch, next_critic_observations_batch, target_values_batch, advantages_batch, returns_batch, \
-                       old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, base_batch
+                yield (
+                    obs_batch,
+                    critic_observations_batch,
+                    actions_batch,
+                    next_critic_observations_batch,
+                    target_values_batch,
+                    advantages_batch,
+                    fused_advantages_batch,
+                    returns_batch,
+                    old_actions_log_prob_batch,
+                    old_mu_batch,
+                    old_sigma_batch,
+                    load_weights_batch,
+                    previous_load_weights_batch,
+                    load_weight_smooth_mask_batch,
+                    payload_predictions_batch,
+                    base_batch,
+                )

@@ -18,6 +18,7 @@ from rsl_rl.modules import (
     EmpiricalNormalization
 )
 from rsl_rl.modules import BaseResidual
+from rsl_rl.modules import TerrainMoeActorCritic
 
 
 class HIMOnPolicyRunner:
@@ -50,11 +51,21 @@ class HIMOnPolicyRunner:
         self.train_action_dim = self.env.num_actions
 
         if self.policy_class_name == "ActorCritic":
+            actor_kwargs = {
+                key: self.policy_cfg[key]
+                for key in (
+                    "actor_hidden_dims",
+                    "critic_hidden_dims",
+                    "activation",
+                    "init_noise_std",
+                )
+                if key in self.policy_cfg
+            }
             actor_critic = actor_critic_class(
                 self.env.num_obs,
                 num_critic_obs,
                 self.train_action_dim,
-                **self.policy_cfg
+                **actor_kwargs
             ).to(self.device)
         elif self.policy_class_name.startswith("ActorCriticArmServoDogPrior"):
             # 这两个网络的签名是 (..., num_one_step_obs, history_length, activation)，
@@ -238,7 +249,12 @@ class HIMOnPolicyRunner:
                 start = stop
                 self.alg.compute_returns(critic_obs)
 
-            mean_value_loss, mean_surrogate_loss, mean_estimation_loss, mean_swap_loss = self.alg.update_simple()
+            (
+                mean_value_loss,
+                mean_surrogate_loss,
+                mean_estimation_loss,
+                mean_gate_loss,
+            ) = self.alg.update_simple()
 
 
             stop = time.time()
@@ -277,10 +293,72 @@ class HIMOnPolicyRunner:
 
         self.writer.add_scalar('Loss/value_function', locs['mean_value_loss'], locs['it'])
         self.writer.add_scalar('Loss/surrogate', locs['mean_surrogate_loss'], locs['it'])
-        self.writer.add_scalar('Loss/Estimation Loss', locs['mean_estimation_loss'], locs['it'])
-        self.writer.add_scalar('Loss/Swap Loss', locs['mean_swap_loss'], locs['it'])
+        self.writer.add_scalar('Loss/Payload', locs['mean_estimation_loss'], locs['it'])
+        self.writer.add_scalar('Loss/LoadGate', locs['mean_gate_loss'], locs['it'])
         self.writer.add_scalar('Loss/learning_rate', self.alg.learning_rate, locs['it'])
         self.writer.add_scalar('Loss/entropy_coef', self.alg.entropy_coef, locs['it'])
+        update_stats = getattr(self.alg, "last_update_stats", {})
+        mapping = {
+            "critic_value_loss_0": "Critic/task_value_loss",
+            "critic_value_loss_1": "Critic/stability_value_loss",
+            "critic_value_loss_2": "Critic/energy_value_loss",
+            "critic_return_0": "Critic/task_return",
+            "critic_return_1": "Critic/stability_return",
+            "critic_return_2": "Critic/energy_return",
+            "critic_advantage_std_0": "Critic/task_advantage_std",
+            "critic_advantage_std_1": "Critic/stability_advantage_std",
+            "critic_advantage_std_2": "Critic/energy_advantage_std",
+            "payload_position_mse": "Payload/position_mse",
+            "payload_torque_mse": "Payload/gravity_torque_mse",
+            "payload_velocity_mse": "Payload/com_velocity_mse",
+            "payload_total_mse": "Payload/total_mse",
+            "risk_risk": "Payload/risk_score",
+            "risk_position": "Payload/com_position_norm",
+            "risk_torque": "Payload/gravity_torque_norm",
+            "risk_velocity": "Payload/com_velocity_norm",
+            "weight_entropy": "LoadGate/weight_entropy",
+            "weight_change_norm": "LoadGate/weight_change_norm",
+            "weight_kl": "LoadGate/weight_kl",
+            "weight_smooth_loss": "LoadGate/weight_smooth_loss",
+            "ppo_grad_norm": "Loss/ppo_grad_norm",
+            "payload_grad_norm": "Loss/payload_grad_norm",
+            "gate_grad_norm": "Loss/gate_grad_norm",
+        }
+        for source, destination in mapping.items():
+            if source in update_stats:
+                self.writer.add_scalar(
+                    destination, update_stats[source], locs['it']
+                )
+        for weight_name in ("task", "stability", "energy"):
+            for kind in ("predicted", "prior", "actual"):
+                key = f"{kind}_{weight_name}_weight"
+                if key in update_stats:
+                    self.writer.add_scalar(
+                        f"LoadGate/{kind}_{weight_name}",
+                        update_stats[key],
+                        locs['it'],
+                    )
+                std_key = f"{kind}_{weight_name}_weight_std"
+                if std_key in update_stats:
+                    self.writer.add_scalar(
+                        f"LoadGate/{kind}_{weight_name}_std",
+                        update_stats[std_key],
+                        locs['it'],
+                    )
+            actual_key = f"actual_{weight_name}_weight"
+            actual_std_key = f"actual_{weight_name}_weight_std"
+            if actual_key in update_stats:
+                self.writer.add_scalar(
+                    f"LoadGate/{weight_name}_weight",
+                    update_stats[actual_key],
+                    locs['it'],
+                )
+            if actual_std_key in update_stats:
+                self.writer.add_scalar(
+                    f"LoadGate/{weight_name}_weight_std",
+                    update_stats[actual_std_key],
+                    locs['it'],
+                )
         # 底座顺应残差监控：残差幅度 + 底座姿态（看底座有没有为臂下蹲/前倾）
         if self.train_base:
             self.writer.add_scalar('BaseResidual/mean_abs', self.env.dog_residual.abs().mean().item(), locs['it'])
@@ -309,8 +387,7 @@ class HIMOnPolicyRunner:
                             'collection_time']:.3f}s, learning {locs['learn_time']:.3f}s)\n"""
                           f"""{'Value function loss:':>{pad}} {locs['mean_value_loss']:.4f}\n"""
                           f"""{'Surrogate loss:':>{pad}} {locs['mean_surrogate_loss']:.4f}\n"""
-                          f"""{'Estimation loss:':>{pad}} {locs['mean_estimation_loss']:.4f}\n"""
-                          f"""{'Swap loss:':>{pad}} {locs['mean_swap_loss']:.4f}\n"""
+                          f"""{'Payload / gate loss:':>{pad}} {locs['mean_estimation_loss']:.6f} / {locs['mean_gate_loss']:.6f}\n"""
                           f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n"""
                           f"""{'Mean reward:':>{pad}} {statistics.mean(locs['rewbuffer']):.2f}\n"""
                           f"""{'Mean episode length:':>{pad}} {statistics.mean(locs['lenbuffer']):.2f}\n""")
@@ -323,8 +400,7 @@ class HIMOnPolicyRunner:
                             'collection_time']:.3f}s, learning {locs['learn_time']:.3f}s)\n"""
                           f"""{'Value function loss:':>{pad}} {locs['mean_value_loss']:.4f}\n"""
                           f"""{'Surrogate loss:':>{pad}} {locs['mean_surrogate_loss']:.4f}\n"""
-                          f"""{'Estimation loss:':>{pad}} {locs['mean_estimation_loss']:.4f}\n"""
-                          f"""{'Swap loss:':>{pad}} {locs['mean_swap_loss']:.4f}\n"""
+                          f"""{'Payload / gate loss:':>{pad}} {locs['mean_estimation_loss']:.6f} / {locs['mean_gate_loss']:.6f}\n"""
                           f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n""")
                         #   f"""{'Mean reward/step:':>{pad}} {locs['mean_reward']:.2f}\n"""
                         #   f"""{'Mean episode length/episode:':>{pad}} {locs['mean_trajectory_length']:.2f}\n""")
@@ -342,6 +418,21 @@ class HIMOnPolicyRunner:
         save_dict = {
             'model_state_dict': self.alg.actor_critic.state_dict(),
             'optimizer_state_dict': self.alg.optimizer.state_dict(),
+            'payload_optimizer_state_dict': (
+                self.alg.payload_optimizer.state_dict()
+                if self.alg.payload_optimizer is not None
+                else None
+            ),
+            'load_gate_optimizer_state_dict': (
+                self.alg.load_gate_optimizer.state_dict()
+                if self.alg.load_gate_optimizer is not None
+                else None
+            ),
+            'architecture_metadata': (
+                self.alg.actor_critic.architecture_metadata()
+                if hasattr(self.alg.actor_critic, "architecture_metadata")
+                else None
+            ),
             'iter': self.current_learning_iteration,
             'infos': infos,
         }
@@ -356,13 +447,57 @@ class HIMOnPolicyRunner:
 
     def load(self, path, load_optimizer=True):
         loaded_dict = torch.load(path)
-        self.alg.actor_critic.load_state_dict(loaded_dict['model_state_dict'])
+        expected_metadata = (
+            self.alg.actor_critic.architecture_metadata()
+            if hasattr(self.alg.actor_critic, "architecture_metadata")
+            else None
+        )
+        saved_metadata = loaded_dict.get("architecture_metadata")
+        if (
+            expected_metadata is not None
+            and saved_metadata is not None
+            and saved_metadata != expected_metadata
+        ):
+            raise RuntimeError(
+                "Checkpoint architecture metadata mismatch: "
+                f"expected {expected_metadata}, got {saved_metadata}"
+            )
+        try:
+            self.alg.actor_critic.load_state_dict(
+                loaded_dict["model_state_dict"]
+            )
+        except RuntimeError as error:
+            raise RuntimeError(
+                "Actor-critic checkpoint is incompatible. Single-critic and "
+                "multi-critic models are intentionally not auto-converted. "
+                f"Original error: {error}"
+            ) from error
         if load_optimizer:
             self.alg.optimizer.load_state_dict(loaded_dict['optimizer_state_dict'])
-            # self.alg.actor_critic.estimator.optimizer.load_state_dict(loaded_dict['estimator_optimizer_state_dict'])
+            if (
+                self.alg.payload_optimizer is not None
+                and loaded_dict.get("payload_optimizer_state_dict") is not None
+            ):
+                self.alg.payload_optimizer.load_state_dict(
+                    loaded_dict["payload_optimizer_state_dict"]
+                )
+            if (
+                self.alg.load_gate_optimizer is not None
+                and loaded_dict.get("load_gate_optimizer_state_dict") is not None
+            ):
+                self.alg.load_gate_optimizer.load_state_dict(
+                    loaded_dict["load_gate_optimizer_state_dict"]
+                )
         if self.empirical_normalization:
-            self.obs_normalizer.load_state_dict(loaded_dict["obs_norm_state_dict"])
-            self.critic_obs_normalizer.load_state_dict(loaded_dict["critic_obs_norm_state_dict"])
+            # Rollout buffers may contain inference tensors under PyTorch 1.10.
+            # Loading within inference mode permits their in-place copy.
+            with torch.inference_mode():
+                self.obs_normalizer.load_state_dict(
+                    loaded_dict["obs_norm_state_dict"]
+                )
+                self.critic_obs_normalizer.load_state_dict(
+                    loaded_dict["critic_obs_norm_state_dict"]
+                )
         if self.train_base and 'base_residual_state_dict' in loaded_dict:
             self.base_residual.load_state_dict(loaded_dict['base_residual_state_dict'])
             if load_optimizer and 'base_optimizer_state_dict' in loaded_dict:
@@ -413,27 +548,80 @@ class HIMOnPolicyRunner:
 
     def _build_and_load_base_policy(self, train_cfg):
         base_policy_path = self.cfg["base_policy_path"]
-        base_policy_cfg = train_cfg.get("base_policy", {})
+        base_policy_cfg = self.cfg.get("base_policy", {})
+        base_policy_class_name = self.cfg.get(
+            "base_policy_class_name", "Actor_mulCritic_attention1"
+        )
+        base_obs_dim = int(
+            self.cfg.get("base_policy_obs_dim", self.env.num_dog_one_step_obs)
+        )
+        history_len = int(
+            self.cfg.get("base_policy_history_len", self.env.history_length)
+        )
+        base_actor_obs_dim = base_obs_dim * history_len
+        base_critic_obs_dim = int(
+            self.cfg.get("base_policy_num_privileged_obs", base_actor_obs_dim)
+        )
 
-        dog_obs_dim = self.env.num_dog_one_step_obs * self.env.history_length
-        dog_critic_obs_dim = dog_obs_dim
+        configure_base_obs = getattr(
+            self.env, "configure_base_policy_observation", None
+        )
+        if configure_base_obs is not None:
+            configure_base_obs(history_len, base_obs_dim)
 
-        # 冻结策略的结构由它自己的 checkpoint 决定，而不是当前 env 配置：
-        # 用第二章训练该 checkpoint 时的 payload_dim，不一致会导致 actor 首层形状不符
-        self.base_policy = Actor_mulCritic_attention1(
-            dog_obs_dim,
-            dog_critic_obs_dim,
-            self.env.num_dog_actions,
-            self.env.num_dog_one_step_obs,
-            self.env.num_dog_one_step_obs,
-            self.env.history_length,
-            payload_dim=int(self.cfg.get("base_policy_payload_dim", 0)),
-            **base_policy_cfg
-        ).to(self.device)
+        self.base_policy_is_terrain_moe = (
+            base_policy_class_name == "TerrainMoeActorCritic"
+        )
+        if self.base_policy_is_terrain_moe:
+            self.base_policy = TerrainMoeActorCritic(
+                base_actor_obs_dim,
+                base_critic_obs_dim,
+                self.env.num_dog_actions,
+                base_obs_dim,
+                None,
+                history_len,
+                **base_policy_cfg
+            ).to(self.device)
+        else:
+            # Legacy frozen policy retained for compatibility with the old
+            # go2_arm checkpoints.
+            self.base_policy = Actor_mulCritic_attention1(
+                base_actor_obs_dim,
+                base_actor_obs_dim,
+                self.env.num_dog_actions,
+                base_obs_dim,
+                base_obs_dim,
+                history_len,
+                payload_dim=int(self.cfg.get("base_policy_payload_dim", 0)),
+                **base_policy_cfg
+            ).to(self.device)
 
         ckpt = torch.load(base_policy_path, map_location=self.device)
         model_state_dict = self._extract_model_state_dict(ckpt)
-        self._load_matching_state_dict(self.base_policy, model_state_dict)
+        if self.base_policy_is_terrain_moe:
+            expected_version = self.cfg.get(
+                "base_policy_architecture_version"
+            )
+            checkpoint_version = (
+                ckpt.get("architecture_version")
+                if isinstance(ckpt, dict)
+                else None
+            )
+            if (
+                expected_version is not None
+                and checkpoint_version != expected_version
+            ):
+                raise RuntimeError(
+                    "Terrain-MoE base checkpoint architecture mismatch: "
+                    f"expected {expected_version}, got {checkpoint_version}"
+                )
+            self.base_policy.load_state_dict(model_state_dict, strict=True)
+            print(
+                "[BasePolicy] strictly loaded Terrain-MoE base "
+                f"({checkpoint_version})"
+            )
+        else:
+            self._load_matching_state_dict(self.base_policy, model_state_dict)
 
         self.base_policy.eval()
         for p in self.base_policy.parameters():
@@ -441,7 +629,7 @@ class HIMOnPolicyRunner:
 
         if self.cfg.get("base_empirical_normalization", False):
             self.base_obs_normalizer = EmpiricalHistoryNormalization(
-                shape=[self.env.num_dog_one_step_obs], until=1.0e8
+                shape=[base_obs_dim], until=1.0e8
             ).to(self.device)
 
             if isinstance(ckpt, dict) and "obs_norm_state_dict" in ckpt:
@@ -455,7 +643,11 @@ class HIMOnPolicyRunner:
             for p in self.base_obs_normalizer.parameters():
                 p.requires_grad = False
 
-        print(f"[BasePolicy] frozen base policy loaded from: {base_policy_path}")
+        print(
+            "[BasePolicy] frozen base policy loaded from: "
+            f"{base_policy_path} "
+            f"(class={base_policy_class_name}, obs={base_actor_obs_dim})"
+        )
 
 
     def _build_base_residual(self, jf):
@@ -508,6 +700,8 @@ class HIMOnPolicyRunner:
             ).reshape(n, d)
 
         with torch.inference_mode():
-            dog_actions = self.base_policy.act_inference(dog_obs)[0]
+            dog_actions = self.base_policy.act_inference(dog_obs)
+            if isinstance(dog_actions, tuple):
+                dog_actions = dog_actions[0]
 
         return dog_actions
