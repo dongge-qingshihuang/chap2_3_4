@@ -60,6 +60,22 @@ _ABLATION_CONFIGS = {
                weight_supervision=0.0, weight_smooth=0.01),
     "D3": dict(multi_critic=True, payload_aware=True, load_aware=True,
                weight_supervision=1.0, weight_smooth=0.01),
+    # Final paper ablations: each mode removes exactly one Chapter 4 module.
+    "B0": dict(multi_critic=True, payload_aware=True, load_aware=True,
+               weight_supervision=1.0, weight_smooth=0.01,
+               trajectory_curriculum=True, pretrained=True),
+    "B1": dict(multi_critic=False, payload_aware=True, load_aware=False,
+               weight_supervision=0.0, weight_smooth=0.0,
+               trajectory_curriculum=True, pretrained=True),
+    "B2": dict(multi_critic=True, payload_aware=True, load_aware=True,
+               weight_supervision=1.0, weight_smooth=0.01,
+               trajectory_curriculum=False, pretrained=True),
+    "B3": dict(multi_critic=True, payload_aware=False, load_aware=False,
+               weight_supervision=0.0, weight_smooth=0.0,
+               trajectory_curriculum=True, pretrained=True),
+    "B4": dict(multi_critic=True, payload_aware=True, load_aware=True,
+               weight_supervision=1.0, weight_smooth=0.01,
+               trajectory_curriculum=True, pretrained=False),
 }
 if EXPERIMENT_MODE not in _ABLATION_CONFIGS:
     raise ValueError(f"Unknown EXPERIMENT_MODE: {EXPERIMENT_MODE}")
@@ -119,9 +135,32 @@ LOAD_STAB_WEIGHT_MAX = 0.70
 LOAD_RISK_THRESHOLD = 0.5
 LOAD_RISK_SLOPE = 5.0
 TASK_ENERGY_RATIO = 0.8
-_POLICY_CLASS_NAME = (
-    "Actor_mulCritic_attention1" if MULTI_CRITIC else "ActorCritic"
+_POLICY_CLASS_NAME = "TerrainMoeActorCritic"
+_USE_PRETRAINED_INIT = _ABLATION.get("pretrained", True)
+PRETRAINED_BASE_CHECKPOINT = (
+    os.path.join(
+        LEGGED_GYM_ROOT_DIR,
+        "base_policies",
+        "go2_terrain_moe_tcn_gate_v2",
+        "model_14999.pt",
+    )
+    if _USE_PRETRAINED_INIT
+    else ""
 )
+PRETRAINED_POLICY_FINETUNE_MODE = "partial"
+EXPERT_FREEZE = True
+GATE_LR_MULTIPLIER = 0.25
+ADAPTER_LR_MULTIPLIER = 0.25
+ACTOR_LR_MULTIPLIER = 1.0
+EXPERT_LR_MULTIPLIER = 0.1
+ARM_TRAJECTORY_CURRICULUM = _ABLATION.get(
+    "trajectory_curriculum", True
+)
+ARM_COMMAND_SOURCE = (
+    "ik_lib_aug" if ARM_TRAJECTORY_CURRICULUM else "ik_lib"
+)
+LOAD_AWARE_ADVANTAGE = LOAD_AWARE_ENABLED
+MULTI_CRITIC_ENABLED = MULTI_CRITIC
 
 
 class Go2ArmRoughCfg( LeggedRobotCfg ):
@@ -246,6 +285,17 @@ class Go2ArmRoughCfg( LeggedRobotCfg ):
             settle_rate_target = 0.04   # 保留：settle 事件率（两轴同时达标）参考用
             curriculum_interval = 50    # 每隔多少个 PPO 迭代评估一次
 
+        class trajectory_curriculum:
+            enabled = ARM_TRAJECTORY_CURRICULUM
+            min_iterations = (0, 200, 500, 1000)
+            min_success_rate = 0.6
+            min_stability_rate = 0.6
+            evaluation_window = 20
+            max_stage = 3
+            load_position_coef = 1.0
+            load_torque_coef = 1.0
+            load_torque_rate_coef = 1.0
+
         class commands:
             # 命令来源（保证位置+姿态联合可达，解决 both_success 仅 1.4% 的根因）：
             #   'ik_lib_aug'  —— 以 IK 库为骨架 + 库内插值 + 局部扰动（推荐：可达、朝向自然、覆盖比纯库宽）
@@ -253,7 +303,7 @@ class Go2ArmRoughCfg( LeggedRobotCfg ):
             #   'joint_space' —— 关节全 limit 均匀采样（覆盖最全但含病态极端腕态，姿态过难）
             #   'random'      —— 旧独立随机采样（位姿大多不可达，仅作对照）
             # 非 'random' 时，下面 l/p/y/rpy 范围不再使用（命令来自 q 的 FK）
-            command_source = "ik_lib_aug"
+            command_source = ARM_COMMAND_SOURCE
             joint_sample_l_range = [0.3, 0.65]   # FK 末端距离接受窗口 [m]（库增广/正向采样都用）
             ik_interp_alpha_max = 0.5            # 库内两配置插值系数上限
             # 库配置局部扰动 std [rad]，按关节分层：近端(j1~j3)小(主要动位置)，
@@ -312,20 +362,22 @@ class Go2ArmRoughCfg( LeggedRobotCfg ):
 
     class env(LeggedRobotCfg.env):
         num_envs = 4096
-        # Frozen base-policy history is independent from the arm policy history.
-        # The terrain-MoE base consumes 45 proprioceptive values over 20 frames.
+        # Chapter 4 PPO controls Go2 only. The arm is driven by trajectory PD.
         base_policy_history_len = 20
         base_policy_obs_dim = 45
-        # dog 45 (+ 第二章白盒负载 9) + arm 30 (+ 第四章 IK 块 6)
-        # 两个开关都关时为 75，布局与原来完全一致
-        num_dog_one_step_observations = 45 + _PAYLOAD_OBS_DIM
-        num_one_step_observations = num_dog_one_step_observations + 30 + _IK_OBS_DIM
-        num_hist = 6 #6
+        num_dog_one_step_observations = 45
+        num_one_step_observations = 45
+        num_hist = 20
         num_observations = num_one_step_observations * num_hist
-        num_recon = num_one_step_observations # next one step obs: current_obs without command + command + base_lin_vel
-        # = one_step_obs + base_lin_vel(3) + disturbance(3) + height_scan(187)
-        #   + 第二章负载真值(9，作监督目标) + contact_mask(4)
-        num_one_step_privileged_obs = num_one_step_observations + 3 + 3 + 187 + _PAYLOAD_PRIV_DIM + 4
+        num_recon = num_one_step_observations
+        num_one_step_privileged_obs = (
+            num_one_step_observations
+            + 3
+            + 3
+            + 187
+            + _PAYLOAD_PRIV_DIM
+            + 4
+        )
         # 值函数维度：1 = 单评论家（第三/四章），3 = task/stab/energy 三头（第二章）
         value_dim = _VALUE_DIM
         num_privileged_obs = num_one_step_privileged_obs * 1 # if not None a priviledge_obs_buf will be returned by step() (critic obs for assymetric training). None is returned otherwise 
@@ -409,41 +461,19 @@ class Go2ArmRoughCfg( LeggedRobotCfg ):
 
 
 
-            task__arm_manip_commands_tracking_combine = 3
+            task__tracking_lin_vel = 1.0
+            task__tracking_ang_vel = 0.5
 
-            # 精修项：窄 sigma 的 fine 跟踪奖励，只在接近目标时强烈起作用，
-            # 弥补 combine（宽 exp）在目标附近梯度变平、推不动最后几 cm/度的问题。
-            # 姿态是瓶颈轴，权重略高。
-            task__arm_pos_tracking_fine = 2.5   # sigma=0.03 m
-            task__arm_ori_tracking_fine = 3.5   # sigma=0.12 rad
-
-            # 事件驱动 settle bonus（一次性稀疏奖励，scale 会乘 dt=0.02，实际单次 +2.0）
-            task__arm_settle = 300
-            # PBRS 误差进展 shaping（gamma*phi' - phi，理论上不改变最优策略）
-            task__arm_pbrs_progress = 100
-            # 臂动作与底座扰动的耦合惩罚（量级较大，从保守值起步，可逐步加强）
-            stab__arm_base_coupling = -0.01
-
-            # 底座顺应残差幅度惩罚。仅在 arm.joint_finetune.enabled=True 时有意义；
-            # 残差关闭时 dog_residual 恒为 0，此项恒零，故置 0 避免占用奖励槽与日志
-            base_residual_penalty = 0.0
-
-            energy__arm_action_rate = -0.01
-            # arm_smoothness = -0.01
-            energy__arm_energy = -1e-6
-            # arm_dof_vel = 0
-            energy__arm_dof_acc = -1e-7
-
+            stab__lin_vel_z = -2.0
+            stab__ang_vel_xy = -0.05
             stab__orientation = -0.2
-            # tracking_lin_vel = 0.5
-            # tracking_ang_vel = 0.2
-            
-            
+            stab__base_height = -1.0
+            stab__feet_slip = -0.01
 
-
-
-
-
+            energy__joint_power = -2e-5
+            energy__dof_acc = -2.5e-7
+            energy__action_rate = -0.01
+            energy__smoothness = -0.01
 
         only_positive_rewards = False # if true negative total rewards are clipped at zero (avoids early termination problems)
         tracking_sigma = 0.25 # tracking reward = exp(-error^2/sigma)
@@ -485,12 +515,47 @@ class Go2ArmRoughCfgPPO( LeggedRobotCfgPPO ):
         load_risk_slope = LOAD_RISK_SLOPE
         task_energy_ratio = TASK_ENERGY_RATIO
     class policy( LeggedRobotCfgPPO.policy ):
+        num_modes = 4
+        latent_dim = 32
+        expert_hidden_dims = (256, 128, 64)
+        actor_hidden_dims = (512, 256, 128)
+        critic_hidden_dims = (512, 256, 128)
+        gate_hidden_dims = (64, 64)
+        dynamics_target_dim = 30
+        contact_dim = 4
+        future_contact_steps = 15
+        terrain_dim = 187
+        activation = "elu"
+        init_noise_std = 0.8
+        ema_tau = 0.01
+        gate_rho = 0.3
+        gate_type = "temporal_tcn"
+        gate_tcn_channels = 32
+        gate_tcn_layers = 3
+        gate_temporal_dim = 32
+        gate_kernel_size = 3
+        gate_output_norm = True
+        gate_balance_coef = 0.1
+        use_auxiliary_loss = True
+        train_perception_with_ppo = False
+        use_ema = True
+        history_encoder = "mlp"
+        history_encoder_hidden_dims = (64, 64, 64)
+        tcn_width = 192
+        tcn_layers = 3
+        velocity_hidden_dims = (128, 64)
+        adapter_hidden_dims = (64,)
+        num_critics = _VALUE_DIM
+        payload_dim = _PAYLOAD_PRIV_DIM
+        payload_hidden_dims = (256, 128)
         load_aware_enabled = LOAD_AWARE_ENABLED
         load_weight_hidden_dim = LOAD_WEIGHT_HIDDEN_DIM
         load_weight_min = LOAD_WEIGHT_MIN
         load_weight_max = LOAD_WEIGHT_MAX
     class runner( LeggedRobotCfgPPO.runner ):
-        empirical_normalization = True
+        # The pretrained Terrain-MoE actor was trained without empirical
+        # normalization; keep the initialization input scale identical.
+        empirical_normalization = False
         policy_class_name = _POLICY_CLASS_NAME
         algorithm_class_name = 'HIMPPO'
         num_steps_per_env = 24 # per iteration
@@ -500,16 +565,24 @@ class Go2ArmRoughCfgPPO( LeggedRobotCfgPPO ):
         save_interval = 500 # check for potential saves every this many iterations
         experiment_name = 'test'
         run_name = 'baseline'
-        use_frozen_base_policy = True
-        base_policy_class_name = "TerrainMoeActorCritic"
-        base_policy_path = os.path.join(
-            LEGGED_GYM_ROOT_DIR,
-            "base_policies",
-            "go2_terrain_moe_tcn_gate",
-            "model_14999.pt",
+        use_frozen_base_policy = False
+        pretrained_base_checkpoint = PRETRAINED_BASE_CHECKPOINT
+        pretrained_policy_architecture_version = (
+            "go2_terrain_moe_v3_mlp_temporal_tcn_gate_norm"
         )
+        pretrained_policy_finetune_mode = PRETRAINED_POLICY_FINETUNE_MODE
+        expert_freeze = EXPERT_FREEZE
+        gate_lr_multiplier = GATE_LR_MULTIPLIER
+        adapter_lr_multiplier = ADAPTER_LR_MULTIPLIER
+        actor_lr_multiplier = ACTOR_LR_MULTIPLIER
+        expert_lr_multiplier = EXPERT_LR_MULTIPLIER
+        arm_trajectory_curriculum = ARM_TRAJECTORY_CURRICULUM
+        load_aware_advantage = LOAD_AWARE_ADVANTAGE
+        multi_critic = MULTI_CRITIC_ENABLED
+        base_policy_class_name = "TerrainMoeActorCritic"
+        base_policy_path = PRETRAINED_BASE_CHECKPOINT
         base_policy_architecture_version = (
-            "go2_terrain_moe_v3_mlp_temporal_tcn_gate"
+            "go2_terrain_moe_v3_mlp_temporal_tcn_gate_norm"
         )
         base_policy_history_len = 20
         base_policy_obs_dim = 45
@@ -536,11 +609,11 @@ class Go2ArmRoughCfgPPO( LeggedRobotCfgPPO ):
             gate_rho = 0.3
             gate_type = "temporal_tcn"
             gate_tcn_channels = 32
-            gate_tcn_layers = 2
+            gate_tcn_layers = 3
             gate_temporal_dim = 32
             gate_kernel_size = 3
-            gate_output_norm = False
-            gate_balance_coef = 0.0
+            gate_output_norm = True
+            gate_balance_coef = 0.1
             use_auxiliary_loss = True
             train_perception_with_ppo = False
             use_ema = True

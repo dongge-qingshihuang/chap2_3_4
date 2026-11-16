@@ -1,7 +1,12 @@
 # Load-Aware Multi-Critic Advantage Fusion
 
-This document describes the Chapter 4 arm-policy method implemented on top of
-the frozen `go2_terrain_moe_tcn_gate` quadruped base.
+> Chapter 4 now controls the 12-D Terrain-MoE Go2 actor and executes the arm
+> with fixed trajectory PD control. See
+> [`chapter4_trainable_base.md`](chapter4_trainable_base.md) for the final
+> architecture. This document remains as the dynamic-fusion design reference.
+
+This document describes the earlier Chapter 4 dynamic-fusion design on top of
+the `go2_terrain_moe_tcn_gate_v2` quadruped base.
 
 ## Network Structure
 

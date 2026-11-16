@@ -144,12 +144,28 @@ class HIMPPO:
         self.task_energy_ratio = float(task_energy_ratio)
         self.last_update_stats = {}
 
-        ppo_parameters = (
-            actor_critic.ppo_parameters()
-            if hasattr(actor_critic, "ppo_parameters")
-            else actor_critic.parameters()
-        )
-        self.optimizer = optim.Adam(ppo_parameters, lr=learning_rate)
+        if hasattr(actor_critic, "policy_parameter_groups"):
+            parameter_groups = []
+            for group in actor_critic.policy_parameter_groups():
+                parameter_groups.append(
+                    {
+                        "params": group["params"],
+                        "lr": learning_rate
+                        * float(group.get("lr_multiplier", 1.0)),
+                        "lr_multiplier": float(
+                            group.get("lr_multiplier", 1.0)
+                        ),
+                        "name": group.get("name", "policy"),
+                    }
+                )
+            self.optimizer = optim.Adam(parameter_groups, lr=learning_rate)
+        else:
+            ppo_parameters = (
+                actor_critic.ppo_parameters()
+                if hasattr(actor_critic, "ppo_parameters")
+                else actor_critic.parameters()
+            )
+            self.optimizer = optim.Adam(ppo_parameters, lr=learning_rate)
         payload_parameters = (
             actor_critic.payload_parameters()
             if hasattr(actor_critic, "payload_parameters")
@@ -331,6 +347,8 @@ class HIMPPO:
             key: 0.0
             for key in ("total", "position", "torque", "velocity")
         }
+        predicted_payload_sums = torch.zeros(9, device=self.device)
+        true_payload_sums = torch.zeros(9, device=self.device)
         predicted_weight_sums = torch.zeros(3, device=self.device)
         predicted_weight_sq_sums = torch.zeros(3, device=self.device)
         prior_weight_sums = torch.zeros(3, device=self.device)
@@ -341,6 +359,10 @@ class HIMPPO:
         weight_change_count = 0
         weight_kl_sum = 0.0
         weight_smooth_sum = 0.0
+        fused_return_sum = 0.0
+        expert_gate_sums = None
+        expert_gate_sq_sums = None
+        expert_gate_entropy_sum = 0.0
         risk_sums = {
             key: 0.0
             for key in ("risk", "position", "torque", "velocity")
@@ -377,6 +399,24 @@ class HIMPPO:
             mu_batch = self.actor_critic.action_mean
             sigma_batch = self.actor_critic.action_std
             entropy_batch = self.actor_critic.entropy
+            perception = getattr(self.actor_critic, "last_perception", None)
+            if isinstance(perception, dict):
+                expert_gate = perception.get("gate_prob")
+                if expert_gate is not None:
+                    if expert_gate_sums is None:
+                        expert_gate_sums = torch.zeros(
+                            expert_gate.size(-1), device=self.device
+                        )
+                        expert_gate_sq_sums = torch.zeros_like(
+                            expert_gate_sums
+                        )
+                    expert_gate_sums += expert_gate.mean(dim=0).detach()
+                    expert_gate_sq_sums += expert_gate.pow(2).mean(
+                        dim=0
+                    ).detach()
+                    expert_gate_entropy_sum += weight_entropy(
+                        expert_gate.detach()
+                    ).mean().item()
 
             # 2) adaptive KL（保留你原来的逻辑）
             if self.desired_kl is not None and self.schedule == "adaptive":
@@ -400,7 +440,12 @@ class HIMPPO:
                         self.learning_rate = min(1e-2, self.learning_rate * 1.5)
 
                     for param_group in self.optimizer.param_groups:
-                        param_group["lr"] = self.learning_rate
+                        param_group["lr"] = (
+                            self.learning_rate
+                            * float(
+                                param_group.get("lr_multiplier", 1.0)
+                            )
+                        )
 
             # 3) PPO surrogate loss
             ratio = torch.exp(actions_log_prob_batch - old_actions_log_prob_batch.squeeze(-1))
@@ -450,7 +495,11 @@ class HIMPPO:
             self.optimizer.zero_grad(set_to_none=True)
             loss.backward()
             ppo_grad_norm += nn.utils.clip_grad_norm_(
-                self.optimizer.param_groups[0]["params"],
+                [
+                    parameter
+                    for group in self.optimizer.param_groups
+                    for parameter in group["params"]
+                ],
                 self.max_grad_norm,
             ).item()
             self.optimizer.step()
@@ -466,12 +515,19 @@ class HIMPPO:
             payload_target = None
             payload_loss = torch.zeros((), device=self.device)
             prop_encoder = getattr(self.actor_critic, "prop_encoder", None)
+            payload_estimator = getattr(
+                self.actor_critic, "payload_estimator", None
+            )
             if (
                 self.payload_slice is not None
                 and self.payload_optimizer is not None
-                and hasattr(prop_encoder, "forward_full")
             ):
-                _, _, payload_prediction = prop_encoder.forward_full(obs_batch)
+                if payload_estimator is not None:
+                    payload_prediction = payload_estimator(obs_batch)
+                elif hasattr(prop_encoder, "forward_full"):
+                    _, _, payload_prediction = prop_encoder.forward_full(
+                        obs_batch
+                    )
                 if payload_prediction is not None:
                     payload_target = critic_obs_batch[:, self.payload_slice].detach()
                     payload_errors = payload_prediction_errors(
@@ -489,6 +545,10 @@ class HIMPPO:
                     self.payload_optimizer.step()
                     for key, value in payload_errors.items():
                         payload_error_sums[key] += value.item()
+                    predicted_payload_sums += (
+                        payload_prediction.detach().mean(dim=0)
+                    )
+                    true_payload_sums += payload_target.mean(dim=0)
 
             # 8) Load-weight supervision. Gate inputs and previous weights are
             # detached; only the gate MLP receives gradients.
@@ -563,6 +623,10 @@ class HIMPPO:
                 actual_weights = load_weights_batch
                 actual_weight_sums += actual_weights.mean(dim=0)
                 actual_weight_sq_sums += actual_weights.pow(2).mean(dim=0)
+            if self.value_dim > 1 and actual_weights is not None:
+                fused_return_sum += (
+                    returns_batch * actual_weights
+                ).sum(dim=-1).mean().item()
             elif self.value_dim > 1:
                 actual_weights = self.value_weights.unsqueeze(0).expand(
                     actions_batch.size(0), -1
@@ -623,6 +687,7 @@ class HIMPPO:
             "ppo_grad_norm": ppo_grad_norm / updates,
             "payload_grad_norm": payload_grad_norm / updates,
             "gate_grad_norm": gate_grad_norm / updates,
+            "total_fused_return": fused_return_sum / updates,
         }
         for index in range(self.value_dim):
             self.last_update_stats[
@@ -636,6 +701,33 @@ class HIMPPO:
             ] = advantage_std_sums[index].item()
         for key, value in payload_error_sums.items():
             self.last_update_stats[f"payload_{key}_mse"] = value
+        predicted_payload = predicted_payload_sums / updates
+        true_payload = true_payload_sums / updates
+        for index in range(9):
+            self.last_update_stats[
+                f"payload_predicted_{index}"
+            ] = predicted_payload[index].item()
+            self.last_update_stats[
+                f"payload_true_{index}"
+            ] = true_payload[index].item()
+        self.last_update_stats["payload_predicted_com_norm"] = (
+            predicted_payload[0:3].norm().item()
+        )
+        self.last_update_stats["payload_true_com_norm"] = (
+            true_payload[0:3].norm().item()
+        )
+        self.last_update_stats["payload_predicted_torque_norm"] = (
+            predicted_payload[3:6].norm().item()
+        )
+        self.last_update_stats["payload_true_torque_norm"] = (
+            true_payload[3:6].norm().item()
+        )
+        self.last_update_stats["payload_predicted_velocity_norm"] = (
+            predicted_payload[6:9].norm().item()
+        )
+        self.last_update_stats["payload_true_velocity_norm"] = (
+            true_payload[6:9].norm().item()
+        )
         if self.value_dim > 1 and not self.load_aware_enabled:
             actual_weight_mean = actual_weight_sums / updates
             actual_weight_std = (
@@ -689,8 +781,31 @@ class HIMPPO:
             )
             for key, value in risk_sums.items():
                 self.last_update_stats[f"risk_{key}"] = value / updates
+        if expert_gate_sums is not None:
+            expert_gate_mean = expert_gate_sums / updates
+            expert_gate_std = (
+                expert_gate_sq_sums / updates - expert_gate_mean.pow(2)
+            ).clamp_min(0.0).sqrt()
+            for mode in range(expert_gate_mean.numel()):
+                self.last_update_stats[
+                    f"expert_gate_weight_{mode}"
+                ] = expert_gate_mean[mode].item()
+                self.last_update_stats[
+                    f"expert_gate_weight_std_{mode}"
+                ] = expert_gate_std[mode].item()
+            self.last_update_stats["expert_gate_entropy"] = (
+                expert_gate_entropy_sum / updates
+            )
+            uniform = torch.full_like(
+                expert_gate_mean, 1.0 / expert_gate_mean.numel()
+            )
+            self.last_update_stats["expert_gate_load_balance"] = (
+                expert_gate_mean - uniform
+            ).abs().sum().item()
 
         self.storage.clear()
+        if hasattr(self.actor_critic, "update_ema_target"):
+            self.actor_critic.update_ema_target()
 
         return (
             mean_value_loss,

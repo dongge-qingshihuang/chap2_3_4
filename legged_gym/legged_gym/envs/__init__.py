@@ -38,6 +38,8 @@ from legged_gym.envs.go2.go2_config import Go2RoughCfg, Go2RoughCfgPPO
 from legged_gym.envs.go2.go2_terrain_moe_config import (
     Go2TerrainMoeTemporalGateCfg,
     Go2TerrainMoeTemporalGateCfgPPO,
+    Go2TerrainMoeTemporalGateV2Cfg,
+    Go2TerrainMoeTemporalGateV2CfgPPO,
 )
 from legged_gym.envs.go2.go2_terrain_moe_env import Go2TerrainMoeEnv
 from legged_gym.envs.go2_arm.go2_arm_config import Go2ArmRoughCfg, Go2ArmRoughCfgPPO
@@ -56,5 +58,11 @@ task_registry.register(
     Go2TerrainMoeEnv,
     Go2TerrainMoeTemporalGateCfg(),
     Go2TerrainMoeTemporalGateCfgPPO(),
+)
+task_registry.register(
+    "go2_terrain_moe_tcn_gate_v2",
+    Go2TerrainMoeEnv,
+    Go2TerrainMoeTemporalGateV2Cfg(),
+    Go2TerrainMoeTemporalGateV2CfgPPO(),
 )
 task_registry.register( "go2_arm", Go2ArmEnv, Go2ArmRoughCfg(), Go2ArmRoughCfgPPO() )

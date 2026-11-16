@@ -99,11 +99,15 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0):
 
     for i in range(1*int(env.max_episode_length)):
     
-        actions_tuple = policy(obs.detach())
+        policy_output = policy(obs.detach())
         env.commands[:, 0] = 1
         env.commands[:, 1] = y_vel
         env.commands[:, 2] = yaw_vel
-        actions = actions_tuple[0]
+        actions = (
+            policy_output[0]
+            if isinstance(policy_output, tuple)
+            else policy_output
+        )
         # mod = actions_tuple[1]
         obs, _, rews, dones, infos, _, _ = env.step(actions)
         base_height = env._get_base_heights(0)

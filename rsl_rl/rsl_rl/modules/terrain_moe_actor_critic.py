@@ -5,6 +5,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Normal
 
+from .load_aware_weights import LoadAwareWeightNetwork
+
 
 def _activation(name):
     activations = {
@@ -328,6 +330,13 @@ class TerrainMoeActorCritic(nn.Module):
         kl_loss_coef=0.1,
         velocity_loss_coef=1.0,
         future_contact_steps=15,
+        num_critics=1,
+        payload_dim=0,
+        payload_hidden_dims=(256, 128),
+        load_aware_enabled=False,
+        load_weight_hidden_dim=64,
+        load_weight_min=0.05,
+        load_weight_max=0.90,
         **kwargs,
     ):
         super().__init__()
@@ -335,6 +344,15 @@ class TerrainMoeActorCritic(nn.Module):
         self.num_critic_obs = num_critic_obs
         self.num_actions = num_actions
         self.num_proprio = num_proprio
+        self.num_critics = int(num_critics)
+        self.payload_dim = int(payload_dim)
+        self.load_aware_enabled = bool(load_aware_enabled)
+        self.finetune_mode = "partial"
+        self.expert_freeze = True
+        self.gate_lr_multiplier = 0.25
+        self.adapter_lr_multiplier = 0.25
+        self.actor_lr_multiplier = 1.0
+        self.expert_lr_multiplier = 0.1
         self.history_len = history_len
         self.num_modes = num_modes
         self.latent_dim = latent_dim
@@ -475,12 +493,60 @@ class TerrainMoeActorCritic(nn.Module):
             num_actions,
             activation,
         )
-        self.critic = build_mlp(
-            num_critic_obs, list(critic_hidden_dims), 1, activation
+        if self.num_critics == 1:
+            self.critic = build_mlp(
+                num_critic_obs, list(critic_hidden_dims), 1, activation
+            )
+            self.critic_trunk = None
+            self.critic_heads = None
+        else:
+            critic_layers = []
+            last_dim = num_critic_obs
+            for hidden_dim in critic_hidden_dims:
+                critic_layers.extend(
+                    [nn.Linear(last_dim, hidden_dim), _activation(activation)()]
+                )
+                last_dim = hidden_dim
+            self.critic = None
+            self.critic_trunk = nn.Sequential(*critic_layers)
+            self.critic_heads = nn.ModuleList(
+                [nn.Linear(last_dim, 1) for _ in range(self.num_critics)]
+            )
+        self.payload_estimator = (
+            build_mlp(
+                num_actor_obs,
+                list(payload_hidden_dims),
+                self.payload_dim,
+                activation,
+            )
+            if self.payload_dim > 0
+            else None
         )
+        self.load_weight_net = (
+            LoadAwareWeightNetwork(
+                payload_dim=self.payload_dim,
+                hidden_dim=load_weight_hidden_dim,
+                min_weight=load_weight_min,
+                max_weight=load_weight_max,
+                num_critics=self.num_critics,
+            )
+            if self.load_aware_enabled
+            else None
+        )
+        if self.load_aware_enabled:
+            if self.payload_dim != 9:
+                raise ValueError(
+                    "load_aware_enabled=True requires a 9-D payload estimator"
+                )
+            if self.num_critics != 3:
+                raise ValueError(
+                    "load_aware_enabled=True requires three critics"
+                )
         self.std = nn.Parameter(torch.ones(num_actions) * init_noise_std)
         self.distribution = None
         self.last_perception = None
+        self.last_payload_prediction = None
+        self.last_load_weights = None
         self.last_aux_metrics = {}
         Normal.set_default_validate_args = False
 
@@ -583,6 +649,23 @@ class TerrainMoeActorCritic(nn.Module):
             gate_prob * (gate_prob + 1e-8).log()
         ).sum(dim=-1).mean()
 
+        payload_prediction = (
+            self.payload_estimator(history)
+            if self.payload_estimator is not None
+            else None
+        )
+        if (
+            self.load_weight_net is not None
+            and payload_prediction is not None
+        ):
+            load_weights = self.load_weight_net(
+                payload_prediction.detach()
+            )
+        else:
+            load_weights = None
+        self.last_payload_prediction = payload_prediction
+        self.last_load_weights = load_weights
+
         perception = {
             "expert_latents": diagnostic_expert_latents,
             "base_latent": diagnostic_base_latent,
@@ -604,6 +687,8 @@ class TerrainMoeActorCritic(nn.Module):
             ),
             "residual": residual,
             "velocity": velocity,
+            "payload_prediction": payload_prediction,
+            "load_weights": load_weights,
         }
         self.last_perception = perception
         return perception
@@ -645,7 +730,12 @@ class TerrainMoeActorCritic(nn.Module):
         return mean
 
     def evaluate(self, critic_observations, **kwargs):
-        return self.critic(critic_observations)
+        if self.critic is not None:
+            return self.critic(critic_observations)
+        features = self.critic_trunk(critic_observations)
+        return torch.cat(
+            [head(features) for head in self.critic_heads], dim=-1
+        )
 
     def predictive_loss(
         self,
@@ -759,25 +849,138 @@ class TerrainMoeActorCritic(nn.Module):
                 target_parameter.mul_(1.0 - tau)
                 target_parameter.add_(online_parameter, alpha=tau)
 
-    def policy_parameters(self):
-        modules = [
+    def configure_finetune(
+        self,
+        mode="partial",
+        expert_freeze=True,
+        gate_lr_multiplier=0.25,
+        adapter_lr_multiplier=0.25,
+        actor_lr_multiplier=1.0,
+        expert_lr_multiplier=0.1,
+    ):
+        """Apply real parameter freezing for Chapter 4 PPO fine-tuning."""
+        mode = str(mode).lower()
+        if mode not in ("partial", "full"):
+            raise ValueError(
+                f"pretrained_policy_finetune_mode must be partial/full, got {mode}"
+            )
+        self.finetune_mode = mode
+        self.expert_freeze = bool(expert_freeze)
+        self.gate_lr_multiplier = float(gate_lr_multiplier)
+        self.adapter_lr_multiplier = float(adapter_lr_multiplier)
+        self.actor_lr_multiplier = float(actor_lr_multiplier)
+        self.expert_lr_multiplier = float(expert_lr_multiplier)
+        expert_requires_grad = mode == "full" and not self.expert_freeze
+        self.train_perception_with_ppo = expert_requires_grad
+        for parameter in self.target_TsDyn_modules.parameters():
+            parameter.requires_grad_(False)
+        for parameter in self.TsDyn_modules.parameters():
+            parameter.requires_grad_(expert_requires_grad)
+        # The pretrained velocity estimator and online experts are frozen in
+        # partial mode. Full mode opts into PPO gradients for them.
+        for parameter in self.velocity_estimator.parameters():
+            parameter.requires_grad_(expert_requires_grad)
+        for module in (
             self.actor,
-            self.critic,
             self.control_adapters,
+            self.critic_trunk,
+            self.critic_heads,
+            self.critic,
+            self.control_gate,
+            self.temporal_gate_encoder,
+            self.payload_estimator,
+            self.load_weight_net,
+        ):
+            if module is not None:
+                for parameter in module.parameters():
+                    parameter.requires_grad_(True)
+        self.std.requires_grad_(True)
+        return self
+
+    def get_payload_estimate(self):
+        return self.last_payload_prediction
+
+    def get_load_weights(self):
+        return self.last_load_weights
+
+    def payload_parameters(self):
+        if self.payload_estimator is None:
+            return []
+        return list(self.payload_estimator.parameters())
+
+    def load_gate_parameters(self):
+        if self.load_weight_net is None:
+            return []
+        return list(self.load_weight_net.parameters())
+
+    def policy_parameter_groups(self):
+        groups = [
+            {
+                "params": list(self.actor.parameters()) + [self.std],
+                "lr_multiplier": self.actor_lr_multiplier,
+                "name": "actor",
+            },
+            {
+                "params": list(self.control_adapters.parameters()),
+                "lr_multiplier": self.adapter_lr_multiplier,
+                "name": "control_adapters",
+            },
         ]
         if self.control_gate is not None:
-            modules.append(self.control_gate)
-        if self.temporal_gate_encoder is not None:
-            modules.append(self.temporal_gate_encoder)
-        if self.train_perception_with_ppo:
-            modules.extend(
-                [self.TsDyn_modules, self.velocity_estimator]
+            gate_parameters = list(self.control_gate.parameters())
+            if self.temporal_gate_encoder is not None:
+                gate_parameters += list(
+                    self.temporal_gate_encoder.parameters()
+                )
+            groups.append(
+                {
+                    "params": gate_parameters,
+                    "lr_multiplier": self.gate_lr_multiplier,
+                    "name": "gate",
+                }
             )
-        parameters = [
-            parameter for module in modules for parameter in module.parameters()
+        critic = (
+            self.critic
+            if self.critic is not None
+            else self.critic_heads
+        )
+        critic_parameters = list(critic.parameters())
+        if self.critic_trunk is not None:
+            critic_parameters += list(self.critic_trunk.parameters())
+        groups.append(
+            {
+                "params": critic_parameters,
+                "lr_multiplier": 1.0,
+                "name": "critic",
+            }
+        )
+        if self.finetune_mode == "full" and not self.expert_freeze:
+            groups.extend(
+                [
+                    {
+                        "params": list(self.TsDyn_modules.parameters()),
+                        "lr_multiplier": self.expert_lr_multiplier,
+                        "name": "online_experts",
+                    },
+                    {
+                        "params": list(self.velocity_estimator.parameters()),
+                        "lr_multiplier": self.gate_lr_multiplier,
+                        "name": "velocity_estimator",
+                    },
+                ]
+            )
+        return [
+            group
+            for group in groups
+            if any(parameter.requires_grad for parameter in group["params"])
         ]
-        parameters.append(self.std)
-        return parameters
+
+    def ppo_parameters(self):
+        return [
+            parameter
+            for group in self.policy_parameter_groups()
+            for parameter in group["params"]
+        ]
 
     def perception_parameters(self):
         if self.train_perception_with_ppo:
@@ -791,8 +994,13 @@ class TerrainMoeActorCritic(nn.Module):
         targets = ["actor", "critic", "adapters"]
         if self.control_gate is not None:
             targets.insert(2, "gate")
-        if self.train_perception_with_ppo:
+        if self.finetune_mode == "full" and not self.expert_freeze:
             targets.extend(["online_experts", "velocity_estimator"])
+        perception_targets = []
+        if self.payload_estimator is not None:
+            perception_targets.append("payload_estimator")
+        if self.load_weight_net is not None:
+            perception_targets.append("load_weight_net")
         return {
             "architecture_version": self.architecture_version,
             "num_modes": self.num_modes,
@@ -812,6 +1020,10 @@ class TerrainMoeActorCritic(nn.Module):
                 self.train_perception_with_ppo
             ),
             "use_ema": self.use_ema,
+            "finetune_mode": self.finetune_mode,
+            "num_critics": self.num_critics,
+            "payload_dim": self.payload_dim,
+            "load_aware_enabled": self.load_aware_enabled,
             "future_contact_steps": self.future_contact_steps,
             "history_encoder": self.history_encoder,
             "history_encoder_hidden_dims": list(
@@ -821,8 +1033,6 @@ class TerrainMoeActorCritic(nn.Module):
             "tcn_layers": self.tcn_layers,
             "ppo_targets": targets,
             "perception_targets": (
-                []
-                if self.train_perception_with_ppo
-                else ["online_experts", "velocity_estimator"]
+                perception_targets
             ),
         }

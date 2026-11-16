@@ -102,17 +102,26 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0):
 
     for i in range(1*int(env.max_episode_length)):
     
-        actions_tuple = policy(obs.detach())
+        policy_output = policy(obs.detach())
         env.commands[:, 0] = 0
         env.commands[:, 1] = y_vel
         env.commands[:, 2] = yaw_vel
-        actions = actions_tuple[0]
-        mod = actions_tuple[1]
+        actions = (
+            policy_output[0]
+            if isinstance(policy_output, tuple)
+            else policy_output
+        )
+        mod = (
+            policy_output[1]
+            if isinstance(policy_output, tuple) and len(policy_output) > 1
+            else None
+        )
         obs, _, rews, dones, infos, _, _ = env.step(actions)
         base_height = env._get_base_heights(0)
         # print("base height:", base_height[0])
-        print("mod is",mod[0,:])
-        if SAVE_MOD_CSV:
+        if mod is not None:
+            print("mod is", mod[0, :])
+        if SAVE_MOD_CSV and mod is not None:
             # 取你正在记录的那台机器人（默认 robot_index=0）
             mod_vec = mod[robot_index].detach().cpu().numpy()  # shape: (K,)
             mod_id = int(np.argmax(mod_vec))                   # one-hot -> 类别编号

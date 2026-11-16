@@ -29,6 +29,6 @@ if __name__ == "__main__":
     )
     args = get_args()
     if not task_was_specified:
-        args.task = "go2_terrain_moe_tcn_gate"
+        args.task = "go2_terrain_moe_tcn_gate_v2"
     args.headless = True
     train(args)

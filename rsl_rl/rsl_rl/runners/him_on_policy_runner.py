@@ -67,6 +67,41 @@ class HIMOnPolicyRunner:
                 self.train_action_dim,
                 **actor_kwargs
             ).to(self.device)
+        elif self.policy_class_name == "TerrainMoeActorCritic":
+            actor_critic = actor_critic_class(
+                self.env.num_obs,
+                num_critic_obs,
+                self.train_action_dim,
+                self.env.num_one_step_obs,
+                self.env.num_rec,
+                self.env.history_length,
+                **self.policy_cfg
+            ).to(self.device)
+            pretrained_checkpoint = self.cfg.get(
+                "pretrained_base_checkpoint"
+            )
+            if pretrained_checkpoint and not self.cfg.get("resume", False):
+                self._initialize_trainable_policy_from_pretrained(
+                    actor_critic, pretrained_checkpoint
+                )
+            actor_critic.configure_finetune(
+                mode=self.cfg.get(
+                    "pretrained_policy_finetune_mode", "partial"
+                ),
+                expert_freeze=self.cfg.get("expert_freeze", True),
+                gate_lr_multiplier=self.cfg.get(
+                    "gate_lr_multiplier", 0.25
+                ),
+                adapter_lr_multiplier=self.cfg.get(
+                    "adapter_lr_multiplier", 0.25
+                ),
+                actor_lr_multiplier=self.cfg.get(
+                    "actor_lr_multiplier", 1.0
+                ),
+                expert_lr_multiplier=self.cfg.get(
+                    "expert_lr_multiplier", 0.1
+                ),
+            )
         elif self.policy_class_name.startswith("ActorCriticArmServoDogPrior"):
             # 这两个网络的签名是 (..., num_one_step_obs, history_length, activation)，
             # 与下面的六位置参数形式不兼容，必须按关键字传
@@ -164,6 +199,92 @@ class HIMOnPolicyRunner:
         self.current_learning_iteration = 0
 
         _, _ = self.env.reset()
+
+    def _initialize_trainable_policy_from_pretrained(
+        self, actor_critic, checkpoint_path
+    ):
+        """Initialize Chapter 4 PPO actor from the Chapter 3 base checkpoint.
+
+        The pretrained checkpoint is first loaded into its original
+        single-critic architecture with ``strict=True``. Matching actor and
+        perception parameters are then copied into the new trainable policy;
+        only explicitly new Chapter 4 modules are initialized fresh.
+        """
+        checkpoint_path = str(checkpoint_path)
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        expected_version = self.cfg.get(
+            "pretrained_policy_architecture_version",
+            "go2_terrain_moe_v3_mlp_temporal_tcn_gate",
+        )
+        if checkpoint.get("architecture_version") != expected_version:
+            raise RuntimeError(
+                "Pretrained base architecture mismatch: "
+                f"expected {expected_version}, "
+                f"got {checkpoint.get('architecture_version')}"
+            )
+
+        base_policy_cfg = self.cfg.get("base_policy", {})
+        pretrained_model = TerrainMoeActorCritic(
+            45 * 20,
+            242,
+            12,
+            45,
+            None,
+            20,
+            **base_policy_cfg
+        ).to(self.device)
+        pretrained_model.load_state_dict(
+            checkpoint["model_state_dict"], strict=True
+        )
+        source_state = pretrained_model.state_dict()
+        destination_state = actor_critic.state_dict()
+        allowed_new_prefixes = (
+            "critic.",
+            "critic_trunk.",
+            "critic_heads.",
+            "payload_estimator.",
+            "load_weight_net.",
+        )
+        unexpected_new = [
+            key
+            for key in destination_state
+            if key not in source_state
+            and not key.startswith(allowed_new_prefixes)
+        ]
+        if unexpected_new:
+            raise RuntimeError(
+                "Unexpected new parameters in Chapter 4 policy: "
+                f"{unexpected_new[:10]}"
+            )
+        transferred = {}
+        for key, value in source_state.items():
+            if key.startswith("critic."):
+                continue
+            if key not in destination_state:
+                raise RuntimeError(
+                    f"Pretrained parameter missing from trainable policy: {key}"
+                )
+            if destination_state[key].shape != value.shape:
+                raise RuntimeError(
+                    "Pretrained parameter shape mismatch for "
+                    f"{key}: checkpoint={tuple(value.shape)}, "
+                    f"policy={tuple(destination_state[key].shape)}"
+                )
+            transferred[key] = value
+        actor_critic.load_state_dict(transferred, strict=False)
+        loaded_state = actor_critic.state_dict()
+        for key, value in transferred.items():
+            if not torch.equal(loaded_state[key], value):
+                raise RuntimeError(
+                    f"Pretrained parameter verification failed: {key}"
+                )
+        actor_critic._pretrained_init_checkpoint = checkpoint_path
+        actor_critic._pretrained_initialized_keys = len(transferred)
+        actor_critic._pretrained_architecture_version = expected_version
+        print(
+            "[PretrainedPolicy] strict-validated original checkpoint and "
+            f"initialized {len(transferred)} trainable-policy parameters"
+        )
 
     def learn(self, num_learning_iterations, init_at_random_ep_len=False):
         if self.log_dir is not None and self.writer is None:
@@ -298,6 +419,16 @@ class HIMOnPolicyRunner:
         self.writer.add_scalar('Loss/learning_rate', self.alg.learning_rate, locs['it'])
         self.writer.add_scalar('Loss/entropy_coef', self.alg.entropy_coef, locs['it'])
         update_stats = getattr(self.alg, "last_update_stats", {})
+        if locs['it'] == 0:
+            self.writer.add_text(
+                "Model/pretrained_initialization",
+                (
+                    f"checkpoint={getattr(self.alg.actor_critic, '_pretrained_init_checkpoint', None)} "
+                    f"keys={getattr(self.alg.actor_critic, '_pretrained_initialized_keys', None)} "
+                    f"finetune_mode={getattr(self.alg.actor_critic, 'finetune_mode', None)}"
+                ),
+                0,
+            )
         mapping = {
             "critic_value_loss_0": "Critic/task_value_loss",
             "critic_value_loss_1": "Critic/stability_value_loss",
@@ -323,6 +454,9 @@ class HIMOnPolicyRunner:
             "ppo_grad_norm": "Loss/ppo_grad_norm",
             "payload_grad_norm": "Loss/payload_grad_norm",
             "gate_grad_norm": "Loss/gate_grad_norm",
+            "total_fused_return": "Critic/total_fused_return",
+            "expert_gate_entropy": "Gate/expert_gate_entropy",
+            "expert_gate_load_balance": "Gate/expert_load_balance",
         }
         for source, destination in mapping.items():
             if source in update_stats:
@@ -359,6 +493,50 @@ class HIMOnPolicyRunner:
                     update_stats[actual_std_key],
                     locs['it'],
                 )
+        for key, value in update_stats.items():
+            if key.startswith("expert_gate_weight_"):
+                mode = key[len("expert_gate_weight_"):]
+                if mode.isdigit():
+                    self.writer.add_scalar(
+                        f"Gate/expert_weight_{mode}",
+                        value,
+                        locs['it'],
+                    )
+                elif mode.startswith("std_"):
+                    expert = mode[len("std_"):]
+                    self.writer.add_scalar(
+                        f"Gate/expert_weight_std_{expert}",
+                        value,
+                        locs['it'],
+                    )
+            elif key.startswith("payload_predicted_"):
+                suffix = key[len("payload_predicted_"):]
+                if suffix.isdigit():
+                    self.writer.add_scalar(
+                        f"Payload/estimated_state_{suffix}",
+                        value,
+                        locs['it'],
+                    )
+                else:
+                    self.writer.add_scalar(
+                        f"Payload/estimated_{suffix}",
+                        value,
+                        locs['it'],
+                    )
+            elif key.startswith("payload_true_"):
+                suffix = key[len("payload_true_"):]
+                if suffix.isdigit():
+                    self.writer.add_scalar(
+                        f"Payload/true_state_{suffix}",
+                        value,
+                        locs['it'],
+                    )
+                else:
+                    self.writer.add_scalar(
+                        f"Payload/true_{suffix}",
+                        value,
+                        locs['it'],
+                    )
         # 底座顺应残差监控：残差幅度 + 底座姿态（看底座有没有为臂下蹲/前倾）
         if self.train_base:
             self.writer.add_scalar('BaseResidual/mean_abs', self.env.dog_residual.abs().mean().item(), locs['it'])
@@ -433,6 +611,28 @@ class HIMOnPolicyRunner:
                 if hasattr(self.alg.actor_critic, "architecture_metadata")
                 else None
             ),
+            'pretrained_initialization': {
+                "checkpoint": getattr(
+                    self.alg.actor_critic,
+                    "_pretrained_init_checkpoint",
+                    None,
+                ),
+                "initialized_keys": getattr(
+                    self.alg.actor_critic,
+                    "_pretrained_initialized_keys",
+                    None,
+                ),
+                "architecture_version": getattr(
+                    self.alg.actor_critic,
+                    "_pretrained_architecture_version",
+                    None,
+                ),
+            },
+            'env_curriculum_state': (
+                self.env.get_curriculum_state()
+                if hasattr(self.env, "get_curriculum_state")
+                else None
+            ),
             'iter': self.current_learning_iteration,
             'infos': infos,
         }
@@ -502,6 +702,24 @@ class HIMOnPolicyRunner:
             self.base_residual.load_state_dict(loaded_dict['base_residual_state_dict'])
             if load_optimizer and 'base_optimizer_state_dict' in loaded_dict:
                 self.alg.base_optimizer.load_state_dict(loaded_dict['base_optimizer_state_dict'])
+        if (
+            loaded_dict.get("env_curriculum_state") is not None
+            and hasattr(self.env, "load_curriculum_state")
+        ):
+            self.env.load_curriculum_state(
+                loaded_dict["env_curriculum_state"]
+            )
+        if loaded_dict.get("pretrained_initialization"):
+            initialization = loaded_dict["pretrained_initialization"]
+            self.alg.actor_critic._pretrained_init_checkpoint = (
+                initialization.get("checkpoint")
+            )
+            self.alg.actor_critic._pretrained_initialized_keys = (
+                initialization.get("initialized_keys")
+            )
+            self.alg.actor_critic._pretrained_architecture_version = (
+                initialization.get("architecture_version")
+            )
         self.current_learning_iteration = loaded_dict['iter']
         return loaded_dict['infos']
 

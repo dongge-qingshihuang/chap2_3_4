@@ -50,6 +50,7 @@ from legged_gym.utils.terrain import Terrain
 from legged_gym.utils.math import quat_apply_yaw, wrap_to_pi, torch_rand_sqrt_float,quaternion_to_rpy
 from legged_gym.utils.helpers import class_to_dict
 from .go2_arm_config import Go2ArmRoughCfg
+from .arm_trajectory_curriculum import ArmTrajectoryCurriculum
 
 class Go2ArmEnv(BaseTask):
     def __init__(self, cfg: Go2ArmRoughCfg, sim_params, physics_engine, sim_device, headless):
@@ -84,8 +85,8 @@ class Go2ArmEnv(BaseTask):
         self.history_length = int(self.num_obs / self.num_one_step_obs)
         self.num_dog_actions = 12              # 狗的 DOF 数，不是 policy action
         self.num_arm_dofs = 8                  # 机械臂总 DOF（含 2 个夹爪）
-        self.num_arm_actions = 6               # policy 真正输出的动作维度
-        self.num_actions = 6                   # env 对外动作维度 = 6
+        self.num_arm_actions = 6               # PD-controlled arm joints
+        self.num_actions = 12                  # Chapter 4 PPO controls Go2 only
 
         self.dog_dof_slice = slice(0, 12)
         self.arm_dof_slice = slice(12, 20)     # arm 全 8 关节
@@ -95,9 +96,13 @@ class Go2ArmEnv(BaseTask):
         # 第三章 "rl"：q = q_current + Δq·action_scale；第四章 "ik_residual"：q = q_ik + Δq·residual_scale
         self.use_ik_control = getattr(self.cfg.arm.ik_control, "mode", "rl") == "ik_residual"
         self.ik_obs_dim = int(getattr(self.cfg.arm.ik_control, "obs_dim", 0))
+        # Physical payload state is also needed by the trajectory curriculum
+        # when load-aware fusion itself is disabled (B3).
+        self.arm_body_masses = self.default_rigid_body_mass[
+            self.arm_body_indices
+        ]
+        self.arm_body_mass_sum = self.arm_body_masses.sum().clamp(min=1e-6)
         if self.payload_awareness != "none":
-            self.arm_body_masses = self.default_rigid_body_mass[self.arm_body_indices]
-            self.arm_body_mass_sum = self.arm_body_masses.sum().clamp(min=1e-6)
             print(f"[Payload] mode={self.payload_awareness} 臂连杆 {self.arm_body_indices.numel()} 个, "
                   f"总质量 {self.arm_body_mass_sum.item():.3f} kg")
         self.effort_flag = 1
@@ -272,9 +277,14 @@ class Go2ArmEnv(BaseTask):
     def _update_arm_ik(self):
         """每个控制步刷新一次名义逆解。热启动自上一步的解，因此少量迭代即可收敛。"""
         if not self.use_ik_control:
+            self.arm_target_vel.zero_()
             return
         p_target, q_target = self._command_pose_in_mount_frame()
-        self.arm_q_ik[:] = self._solve_arm_ik(p_target, q_target, self.arm_q_ik)
+        previous = self.arm_q_ik.clone()
+        self.arm_q_ik[:] = self._solve_arm_ik(
+            p_target, q_target, self.arm_q_ik
+        )
+        self.arm_target_vel[:] = (self.arm_q_ik - previous) / self.dt
 
     def _ik_obs_block(self):
         """第四章观测追加块：名义逆解相对当前构型的偏差，告诉策略“模型认为该往哪走”。"""
@@ -829,7 +839,11 @@ class Go2ArmEnv(BaseTask):
 
     def _advance_arm_trajectory(self):
         """每步推进所有环境的轨迹进度并刷新命令（轨迹关闭时为静态目标，进度恒为 T）。"""
-        self.arm_traj_t = torch.clamp(self.arm_traj_t + 1.0, max=float(self.arm_traj_T))
+        torch.clamp(
+            self.arm_traj_t + 1.0,
+            max=float(self.arm_traj_T),
+            out=self.arm_traj_t,
+        )
         all_ids = torch.arange(self.num_envs, device=self.device)
         self._compute_traj_command(all_ids)
 
@@ -862,6 +876,15 @@ class Go2ArmEnv(BaseTask):
 
     def _resample_arm_commands(self, env_ids, use_traj=True):
         if len(env_ids) == 0:
+            return
+
+        curriculum = getattr(self, "arm_trajectory_curriculum", None)
+        if curriculum is not None and curriculum.enabled:
+            q6 = curriculum.sample_q(self, env_ids)
+            self._set_arm_commands_from_q(
+                env_ids, q6, use_traj=use_traj
+            )
+            curriculum.begin_trajectories(env_ids)
             return
 
         # 可达命令采样：位置和姿态由同一条真实关节配置 q 的 FK 导出，联合可达
@@ -968,6 +991,15 @@ class Go2ArmEnv(BaseTask):
                     device=self.device,
                 )
             )
+
+    def get_curriculum_state(self):
+        curriculum = getattr(self, "arm_trajectory_curriculum", None)
+        return curriculum.state_dict() if curriculum is not None else None
+
+    def load_curriculum_state(self, state):
+        curriculum = getattr(self, "arm_trajectory_curriculum", None)
+        if curriculum is not None:
+            curriculum.load_state_dict(state)
 
     def _dog_obs_block(self):
         """底座本体观测块。第二章白盒模式下在尾部追加解析负载状态；
@@ -1114,6 +1146,12 @@ class Go2ArmEnv(BaseTask):
         """
         clip_actions = self.cfg.normalization.clip_actions
         self.actions = torch.clip(actions, -clip_actions, clip_actions).to(self.device)
+        if self.actions.shape[-1] != self.num_dog_actions:
+            raise ValueError(
+                "Chapter 4 expects 12 Go2 actions, got "
+                f"{self.actions.shape[-1]}"
+            )
+        self.dog_actions[:] = self.actions
 
         self.delayed_actions = self.actions.clone().view(self.num_envs, 1, self.num_actions).repeat(1, self.cfg.control.decimation, 1)
         delay_steps = torch.randint(0, self.cfg.control.decimation, (self.num_envs, 1), device=self.device)
@@ -1170,7 +1208,14 @@ class Go2ArmEnv(BaseTask):
 
         self._post_physics_step_callback()
         self._compute_arm_error_obs()
+        curriculum = getattr(self, "arm_trajectory_curriculum", None)
+        if curriculum is not None and curriculum.enabled:
+            curriculum.observe_payload(
+                self._compute_payload_state(), self.dt
+            )
         self._update_arm_settle()
+        if curriculum is not None and curriculum.enabled:
+            curriculum.update_stages(self.ppo_it)
 
         # compute observations, rewards, resets, ...
         self.check_termination()
@@ -1183,6 +1228,17 @@ class Go2ArmEnv(BaseTask):
         if not self.keep_arm_fixed:
             settled_ids = (self.settle_buf & ~self.reset_buf).nonzero(as_tuple=False).flatten()
             if len(settled_ids) > 0:
+                if curriculum is not None and curriculum.enabled:
+                    stable = (
+                        (torch.abs(self.roll[settled_ids]) < 0.5)
+                        & (torch.abs(self.pitch[settled_ids]) < 0.5)
+                        & (self._get_base_heights(settled_ids) > 0.20)
+                    )
+                    curriculum.record_result(
+                        settled_ids,
+                        torch.ones_like(stable),
+                        stable,
+                    )
                 self._resample_arm_commands(settled_ids)
                 self.arm_settle_counter[settled_ids] = 0
 
@@ -1271,6 +1327,23 @@ class Go2ArmEnv(BaseTask):
         """
         if len(env_ids) == 0:
             return
+        curriculum = getattr(self, "arm_trajectory_curriculum", None)
+        if (
+            curriculum is not None
+            and curriculum.enabled
+            and self.init_done
+            and hasattr(self, "roll")
+        ):
+            stable = (
+                (torch.abs(self.roll[env_ids]) < 0.5)
+                & (torch.abs(self.pitch[env_ids]) < 0.5)
+                & (self._get_base_heights(env_ids) > 0.20)
+            )
+            curriculum.record_result(
+                env_ids,
+                self.settle_buf[env_ids],
+                stable,
+            )
         # update curriculum
         if self.cfg.terrain.curriculum:
             self._update_terrain_curriculum(env_ids)
@@ -1300,6 +1373,7 @@ class Go2ArmEnv(BaseTask):
 
         # 逆解热启动重置为默认臂姿，避免沿用上一回合的解
         self.arm_q_ik[env_ids] = self.default_dof_pos[:, self.arm_control_dof_slice]
+        self.arm_target_vel[env_ids] = 0.0
 
         # settle / PBRS buffers
         self.arm_settle_counter[env_ids] = 0
@@ -1361,6 +1435,35 @@ class Go2ArmEnv(BaseTask):
         self.episode_pos_err_sum[env_ids] = 0.
         self.episode_ori_err_sum[env_ids] = 0.
         self.episode_settle_count[env_ids] = 0.
+        if curriculum is not None and curriculum.enabled:
+            curriculum_metrics = curriculum.metadata()
+            self.extras["episode"]["curriculum_stage"] = (
+                curriculum_metrics["stage"][env_ids].float().mean()
+            )
+            self.extras["episode"]["curriculum_success_rate"] = (
+                curriculum_metrics["mean_success_rate"]
+            )
+            self.extras["episode"]["curriculum_stability_rate"] = (
+                curriculum_metrics["mean_stability_rate"]
+            )
+            self.extras["episode"]["curriculum_load_difficulty"] = (
+                curriculum_metrics["mean_load_difficulty"]
+            )
+            self.extras["episode"]["curriculum_ik_success_rate"] = (
+                curriculum_metrics["ik_success_rate"]
+            )
+            self.extras["episode"]["curriculum_settle_rate"] = (
+                curriculum_metrics["mean_success_rate"]
+            )
+            self.extras["episode"]["curriculum_trajectory_completion_rate"] = (
+                curriculum_metrics["mean_success_rate"]
+            )
+            for stage_index, ratio in enumerate(
+                curriculum_metrics["stage_sampling"]
+            ):
+                self.extras["episode"][
+                    f"curriculum_stage_sampling_{stage_index}"
+                ] = ratio
         # log additional curriculum info
         if self.cfg.terrain.curriculum:
             self.extras["episode"]["terrain_level"] = torch.mean(self.terrain_levels.float())
@@ -1410,41 +1513,12 @@ class Go2ArmEnv(BaseTask):
     def compute_observations(self):
         self._refresh_ee_state()
 
-
-        # -------------------------
-        # dog obs prefix: 顺序完全保持不变
-        # -------------------------
-        dog_obs = self._dog_obs_block()
-
-        # -------------------------
-        # arm obs: 追加在后面
-        # -------------------------
-        arm_pos = (self.dof_pos[:, self.arm_control_dof_slice] - self.default_dof_pos[:, self.arm_control_dof_slice]) * self.obs_scales.dof_pos
-        arm_vel = self.dof_vel[:, self.arm_control_dof_slice] * self.obs_scales.dof_vel
-
-        arm_error_obs = self._get_arm_se3_error_obs()
-
-        arm_obs_terms = [
-            arm_pos,               # 6
-            arm_vel,               # 6
-            self.commands_arm_obs, # 6
-            arm_error_obs,         # 6
-            self.actions,          # 6
-        ]
-        if self.ik_obs_dim > 0:
-            arm_obs_terms.append(self._ik_obs_block())   # 6，仅第四章
-        arm_obs = torch.cat(arm_obs_terms, dim=-1)
-
-        current_obs = torch.cat((dog_obs, arm_obs), dim=-1)
+        current_obs = self._dog_obs_block()
 
         if self.add_noise:
             current_obs += (2 * torch.rand_like(current_obs) - 1) * self.noise_scale_vec[:current_obs.shape[1]]
 
-        # The base policy has its own history length. Keep the arm history at
-        # num_hist while supplying the frozen base with its original window.
-        self.dog_obs_history.append(
-            current_obs[:, :self.base_policy_obs_dim]
-        )
+        self.dog_obs_history.append(current_obs)
         self.obs_history.append(current_obs)
         obs_history = torch.stack([self.obs_history[i] for i in range(self.obs_history.maxlen)], dim=1)
         self.obs_buf = obs_history.reshape(self.num_envs, -1)
@@ -1503,7 +1577,11 @@ class Go2ArmEnv(BaseTask):
 
         in_pos = self.arm_pos_err_norm < self.settle_pos_tol
         in_ori = self.arm_ori_err_norm < self.settle_ori_tol
-        in_tol = in_pos & in_ori
+        if self.use_arm_traj:
+            trajectory_finished = self.arm_traj_t >= float(self.arm_traj_T)
+        else:
+            trajectory_finished = torch.ones_like(in_pos)
+        in_tol = in_pos & in_ori & trajectory_finished
         self.arm_settle_counter = torch.where(
             in_tol,
             self.arm_settle_counter + 1,
@@ -1559,71 +1637,17 @@ class Go2ArmEnv(BaseTask):
 
     def get_current_obs(self):
         self._refresh_ee_state()
-
-        dog_pos = (self.dof_pos[:, self.dog_dof_slice] - self.default_dof_pos[:, self.dog_dof_slice]) * self.obs_scales.dof_pos
-        dog_vel = self.dof_vel[:, self.dog_dof_slice] * self.obs_scales.dof_vel
-
-        dog_obs = torch.cat((
-            self.commands[:, :3] * self.commands_scale,
-            self.base_ang_vel * self.obs_scales.ang_vel,
-            self.projected_gravity,
-            dog_pos,
-            dog_vel,
-            self.dog_actions
-        ), dim=-1)
-
-        arm_pos = (self.dof_pos[:, self.arm_control_dof_slice] - self.default_dof_pos[:, self.arm_control_dof_slice]) * self.obs_scales.dof_pos
-        arm_vel = self.dof_vel[:, self.arm_control_dof_slice] * self.obs_scales.dof_vel
-
-        arm_obs = torch.cat((
-            arm_pos,
-            arm_vel,
-            self.commands_arm_obs,
-            self.actions
-        ), dim=-1)
-
-        current_obs = torch.cat((dog_obs, arm_obs), dim=-1)
+        current_obs = self._dog_obs_block()
 
         if self.add_noise:
             current_obs += (2 * torch.rand_like(current_obs) - 1) * self.noise_scale_vec[:current_obs.shape[1]]
 
-        privileged_current_obs = torch.cat((
-            current_obs,
-            self.base_lin_vel * self.obs_scales.lin_vel,
-            self.disturbance[:, 0, :]
-        ), dim=-1)
-
-        if self.cfg.terrain.measure_heights:
-            heights = torch.clip(
-                self.root_states[:, 2].unsqueeze(1) - 0.5 - self.measured_heights,
-                -1, 1.
-            ) * self.obs_scales.height_measurements
-            privileged_current_obs = torch.cat((privileged_current_obs, heights), dim=-1)
-
-        return privileged_current_obs
+        return self._privileged_current_obs(current_obs)
         
     def compute_termination_observations(self, env_ids):
         self._refresh_ee_state()
 
-        dog_obs = self._dog_obs_block()
-
-        arm_pos = (self.dof_pos[:, self.arm_control_dof_slice] - self.default_dof_pos[:, self.arm_control_dof_slice]) * self.obs_scales.dof_pos
-        arm_vel = self.dof_vel[:, self.arm_control_dof_slice] * self.obs_scales.dof_vel
-
-        arm_error_obs = self._get_arm_se3_error_obs()
-
-        arm_obs_terms = [
-            arm_pos,
-            arm_vel,
-            self.commands_arm_obs,
-            arm_error_obs,
-            self.actions,
-        ]
-        if self.ik_obs_dim > 0:
-            arm_obs_terms.append(self._ik_obs_block())   # 6，仅第四章
-        arm_obs = torch.cat(arm_obs_terms, dim=-1)
-
-        current_obs = torch.cat((dog_obs, arm_obs), dim=-1)
+        current_obs = self._dog_obs_block()
 
         if self.add_noise:
             current_obs += (2 * torch.rand_like(current_obs) - 1) * self.noise_scale_vec[:current_obs.shape[1]]
@@ -1817,13 +1841,13 @@ class Go2ArmEnv(BaseTask):
         # set small commands to zero
         self.commands[env_ids, :2] *= (torch.norm(self.commands[env_ids, :2], dim=1) > 0.2).unsqueeze(1)
 
-    def _compute_torques(self, arm_actions):
+    def _compute_torques(self, dog_actions):
         torques = torch.zeros(self.num_envs, self.num_dof, device=self.device)
 
         # -------------------------
-        # dog torques: 用冻结策略输出的 dog_actions
+        # dog torques: PPO base actor output
         # -------------------------
-        dog_actions_scaled = self.dog_actions * self.cfg.control.action_scale
+        dog_actions_scaled = dog_actions * self.cfg.control.action_scale
         dog_target = self.default_dof_pos[:, self.dog_dof_slice] + dog_actions_scaled
 
         control_type = self.cfg.control.control_type
@@ -1842,25 +1866,36 @@ class Go2ArmEnv(BaseTask):
                 (self.dof_vel[:, self.dog_dof_slice] - self.last_dof_vel[:, self.dog_dof_slice]) / self.sim_params.dt
             )
         elif control_type == "T":
-            torques[:, self.dog_dof_slice] = self.dog_actions
+            torques[:, self.dog_dof_slice] = dog_actions
         else:
             raise NameError(f"Unknown controller type: {control_type}")
 
         # -------------------------
-        # arm torques: 6维动作 -> 8维目标 -> PD
+        # arm torques: fixed trajectory target executed by PD
         # -------------------------
         if self.keep_arm_fixed:
             arm_target = self.default_dof_pos[:, self.arm_dof_slice].expand(self.num_envs, -1)
+            arm_target_vel = torch.zeros_like(arm_target)
         else:
-            arm_target = self._compute_arm_target_from_actions(arm_actions)
+            arm_target = torch.zeros(
+                self.num_envs,
+                self.num_arm_dofs,
+                device=self.device,
+            )
+            arm_target[:, :6] = self.arm_q_ik
+            arm_target[:, 6:] = self.default_dof_pos[
+                :, self.gripper_dof_slice
+            ].expand(self.num_envs, -1)
+            arm_target_vel = torch.zeros_like(arm_target)
+            arm_target_vel[:, :6] = self.arm_target_vel
 
         self.arm_target_q[:] = arm_target
 
         torques[:, self.arm_dof_slice] = (
             self.p_gains[self.arm_dof_slice].unsqueeze(0) *
             (arm_target - self.dof_pos[:, self.arm_dof_slice])
-            - self.d_gains[self.arm_dof_slice].unsqueeze(0) *
-            self.dof_vel[:, self.arm_dof_slice]
+            + self.d_gains[self.arm_dof_slice].unsqueeze(0) *
+            (arm_target_vel - self.dof_vel[:, self.arm_dof_slice])
         )
 
         return torch.clip(torques, -self.torque_limits, self.torque_limits)
@@ -2001,11 +2036,10 @@ class Go2ArmEnv(BaseTask):
 
 
     def _get_noise_scale_vec(self, cfg):
-        actor_obs_dim = (75
-                         + int(getattr(self.cfg.arm.ik_control, "obs_dim", 0))
-                         + int(getattr(self.cfg.arm.payload, "obs_dim", 0)))
-        height_dim = 187 if self.cfg.terrain.measure_heights else 0
-        noise_vec = torch.zeros(actor_obs_dim + height_dim, device=self.device)
+        noise_vec = torch.zeros(
+            int(getattr(cfg.env, "num_dog_one_step_observations", 45)),
+            device=self.device,
+        )
 
         self.add_noise = self.cfg.noise.add_noise
         noise_scales = self.cfg.noise.noise_scales
@@ -2036,43 +2070,6 @@ class Go2ArmEnv(BaseTask):
         # dog previous actions (12)
         noise_vec[idx:idx+12] = 0.
         idx += 12
-
-        # 第二章白盒负载块 (9)：量纲为 m / N·m / m·s⁻¹，与 dof 噪声不同量纲，这里不加噪
-        payload_obs_dim = int(getattr(self.cfg.arm.payload, "obs_dim", 0))
-        if payload_obs_dim > 0:
-            noise_vec[idx:idx+payload_obs_dim] = 0.
-            idx += payload_obs_dim
-
-        # arm_pos (6)
-        noise_vec[idx:idx+6] = noise_scales.dof_pos * noise_level * self.obs_scales.dof_pos
-        idx += 6
-
-        # arm_vel (6)
-        noise_vec[idx:idx+6] = noise_scales.dof_vel * noise_level * self.obs_scales.dof_vel
-        idx += 6
-
-        # arm command obs [l, p, y, roll, pitch, yaw] (6)
-        noise_vec[idx:idx+6] = 0.
-        idx += 6
-
-        # arm tracking error [l_err, p_err, y_err, a_err, b_err, g_err] (6)
-        noise_vec[idx:idx+6] = 0.
-        idx += 6
-
-        # arm previous actions (6)
-        noise_vec[idx:idx+6] = 0.
-        idx += 6
-
-        # 第四章 IK 块 (6)：含实测关节角，按 dof_pos 噪声处理
-        ik_dim = int(getattr(self.cfg.arm.ik_control, "obs_dim", 0))
-        if ik_dim > 0:
-            noise_vec[idx:idx+ik_dim] = noise_scales.dof_pos * noise_level * self.obs_scales.dof_pos
-            idx += ik_dim
-
-        if self.cfg.terrain.measure_heights:
-            noise_vec[idx:idx+187] = (
-                noise_scales.height_measurements * noise_level * self.obs_scales.height_measurements
-            )
 
         return noise_vec
 
@@ -2194,6 +2191,9 @@ class Go2ArmEnv(BaseTask):
 
         # 第四章：解析逆解的名义关节角（热启动缓存）
         self.arm_q_ik = torch.zeros(self.num_envs, 6, device=self.device)
+        self.arm_target_vel = torch.zeros(
+            self.num_envs, 6, device=self.device
+        )
 
         # 末端位姿 FK 缓存标志（见 _refresh_ee_state）
         self._ee_state_fresh = False
@@ -2303,6 +2303,20 @@ class Go2ArmEnv(BaseTask):
 
         # 从 IK 可达性库加载关节配置，用于采样"按构造可达"的位姿命令
         self._load_ik_lib()
+        tc = self.cfg.arm.trajectory_curriculum
+        self.arm_trajectory_curriculum = ArmTrajectoryCurriculum(
+            self.num_envs,
+            self.device,
+            enabled=tc.enabled,
+            min_iterations=tc.min_iterations,
+            min_success_rate=tc.min_success_rate,
+            min_stability_rate=tc.min_stability_rate,
+            evaluation_window=tc.evaluation_window,
+            max_stage=tc.max_stage,
+            load_position_coef=tc.load_position_coef,
+            load_torque_coef=tc.load_torque_coef,
+            load_torque_rate_coef=tc.load_torque_rate_coef,
+        )
 
 
         self.base_lin_vel = quat_rotate_inverse(self.base_quat, self.root_states[:, 7:10])
@@ -2756,15 +2770,20 @@ class Go2ArmEnv(BaseTask):
         Returns:
             [type]: [description]
         """
+        has_env_ids = env_ids is not None and len(env_ids) > 0
         if self.cfg.terrain.mesh_type == 'plane':
+            if has_env_ids:
+                return torch.zeros(len(env_ids), self.num_height_points, device=self.device, requires_grad=False)
             return torch.zeros(self.num_envs, self.num_height_points, device=self.device, requires_grad=False)
         elif self.cfg.terrain.mesh_type == 'none':
             raise NameError("Can't measure height with terrain mesh type 'none'")
 
-        if env_ids:
+        if has_env_ids:
             points = quat_apply_yaw(self.base_quat[env_ids].repeat(1, self.num_height_points), self.height_points[env_ids]) + (self.root_states[env_ids, :3]).unsqueeze(1)
+            num_samples = len(env_ids)
         else:
             points = quat_apply_yaw(self.base_quat.repeat(1, self.num_height_points), self.height_points) + (self.root_states[:, :3]).unsqueeze(1)
+            num_samples = self.num_envs
 
 
         points += self.terrain.cfg.border_size
@@ -2780,7 +2799,7 @@ class Go2ArmEnv(BaseTask):
         heights = torch.min(heights1, heights2)
         heights = torch.min(heights, heights3)
 
-        return heights.view(self.num_envs, -1) * self.terrain.cfg.vertical_scale
+        return heights.view(num_samples, -1) * self.terrain.cfg.vertical_scale
     
     def _get_base_heights(self, env_ids=None):
         """ Samples heights of the terrain at required points around each robot.
@@ -2795,15 +2814,22 @@ class Go2ArmEnv(BaseTask):
         Returns:
             [type]: [description]
         """
+        has_env_ids = env_ids is not None and len(env_ids) > 0
         if self.cfg.terrain.mesh_type == 'plane':
+            if has_env_ids:
+                return self.root_states[env_ids, 2].clone()
             return self.root_states[:, 2].clone()
         elif self.cfg.terrain.mesh_type == 'none':
             raise NameError("Can't measure height with terrain mesh type 'none'")
 
-        if env_ids:
+        if has_env_ids:
             points = quat_apply_yaw(self.base_quat[env_ids].repeat(1, self.num_base_height_points), self.base_height_points[env_ids]) + (self.root_states[env_ids, :3]).unsqueeze(1)
+            root_height = self.root_states[env_ids, 2]
+            num_samples = len(env_ids)
         else:
             points = quat_apply_yaw(self.base_quat.repeat(1, self.num_base_height_points), self.base_height_points) + (self.root_states[:, :3]).unsqueeze(1)
+            root_height = self.root_states[:, 2]
+            num_samples = self.num_envs
 
 
         points += self.terrain.cfg.border_size
@@ -2820,8 +2846,8 @@ class Go2ArmEnv(BaseTask):
         heights = torch.min(heights, heights3)
         # heights = (heights1 + heights2 + heights3) / 3
 
-        base_height =  heights.view(self.num_envs, -1) * self.terrain.cfg.vertical_scale
-        base_height = torch.mean(self.root_states[:, 2].unsqueeze(1) - base_height, dim=1)
+        base_height =  heights.view(num_samples, -1) * self.terrain.cfg.vertical_scale
+        base_height = torch.mean(root_height.unsqueeze(1) - base_height, dim=1)
 
         return base_height
     
@@ -2838,15 +2864,22 @@ class Go2ArmEnv(BaseTask):
         Returns:
             [type]: [description]
         """
+        has_env_ids = env_ids is not None and len(env_ids) > 0
         if self.cfg.terrain.mesh_type == 'plane':
+            if has_env_ids:
+                return self.feet_pos[env_ids, :, 2].clone()
             return self.feet_pos[:, :, 2].clone()
         elif self.cfg.terrain.mesh_type == 'none':
             raise NameError("Can't measure height with terrain mesh type 'none'")
 
-        if env_ids:
+        if has_env_ids:
             points = self.feet_pos[env_ids].clone()
+            feet_pos_z = self.feet_pos[env_ids, :, 2]
+            num_samples = len(env_ids)
         else:
             points = self.feet_pos.clone()
+            feet_pos_z = self.feet_pos[:, :, 2]
+            num_samples = self.num_envs
 
         points += self.terrain.cfg.border_size
         points = (points/self.terrain.cfg.horizontal_scale).long()
@@ -2862,9 +2895,9 @@ class Go2ArmEnv(BaseTask):
         # heights = torch.min(heights, heights3)
         heights = (heights1 + heights2 + heights3) / 3
 
-        heights = heights.view(self.num_envs, -1) * self.terrain.cfg.vertical_scale
+        heights = heights.view(num_samples, -1) * self.terrain.cfg.vertical_scale
 
-        feet_height =  self.feet_pos[:, :, 2] - heights
+        feet_height = feet_pos_z - heights
 
         return feet_height
 
@@ -2931,6 +2964,56 @@ class Go2ArmEnv(BaseTask):
         # Tracking of angular velocity commands (yaw) 
         ang_vel_error = torch.square(self.commands[:, 2] - self.base_ang_vel[:, 2])
         return torch.exp(-ang_vel_error/self.cfg.rewards.tracking_sigma)
+
+    def _reward_lin_vel_z(self):
+        return torch.square(self.base_lin_vel[:, 2])
+
+    def _reward_ang_vel_xy(self):
+        return torch.sum(torch.square(self.base_ang_vel[:, :2]), dim=1)
+
+    def _reward_base_height(self):
+        base_height = self._get_base_heights()
+        return torch.square(
+            base_height - self.cfg.rewards.base_height_target
+        )
+
+    def _reward_feet_slip(self):
+        contact = self.contact_mask.float()
+        slip = torch.sum(
+            torch.square(self.feet_vel[:, :, :2]), dim=-1
+        )
+        return torch.sum(slip * contact, dim=1) / contact.sum(
+            dim=1
+        ).clamp_min(1.0)
+
+    def _reward_joint_power(self):
+        power = (
+            self.torques[:, self.dog_dof_slice]
+            * self.dof_vel[:, self.dog_dof_slice]
+        )
+        return torch.sum(torch.square(power), dim=1)
+
+    def _reward_dof_acc(self):
+        acceleration = (
+            self.dof_vel[:, self.dog_dof_slice]
+            - self.last_dof_vel[:, self.dog_dof_slice]
+        ) / self.dt
+        return torch.sum(torch.square(acceleration), dim=1)
+
+    def _reward_action_rate(self):
+        return torch.sum(
+            torch.square(self.last_actions - self.actions), dim=1
+        )
+
+    def _reward_smoothness(self):
+        return torch.sum(
+            torch.square(
+                self.actions
+                - 2.0 * self.last_actions
+                + self.last_last_actions
+            ),
+            dim=1,
+        )
 
 
 
