@@ -75,7 +75,14 @@ _ABLATION_CONFIGS = {
                trajectory_curriculum=True, pretrained=True),
     "B4": dict(multi_critic=True, payload_aware=True, load_aware=True,
                weight_supervision=1.0, weight_smooth=0.01,
-               trajectory_curriculum=True, pretrained=False),
+               trajectory_curriculum=True, pretrained=False,
+               finetune_mode="full", expert_freeze=False),
+    # Supplementary control for B4: same full unfreeze scope, but initialized
+    # from V2. Use B0F vs B4 to isolate pretraining without a freeze mismatch.
+    "B0F": dict(multi_critic=True, payload_aware=True, load_aware=True,
+                weight_supervision=1.0, weight_smooth=0.01,
+                trajectory_curriculum=True, pretrained=True,
+                finetune_mode="full", expert_freeze=False),
 }
 if EXPERIMENT_MODE not in _ABLATION_CONFIGS:
     raise ValueError(f"Unknown EXPERIMENT_MODE: {EXPERIMENT_MODE}")
@@ -131,10 +138,12 @@ LOAD_RISK_POSITION_COEF = 1.0
 LOAD_RISK_TORQUE_COEF = 1.0
 LOAD_RISK_VELOCITY_COEF = 1.0
 LOAD_STAB_WEIGHT_MIN = 0.20
-LOAD_STAB_WEIGHT_MAX = 0.70
-LOAD_RISK_THRESHOLD = 0.5
+LOAD_STAB_WEIGHT_MAX = _ABLATION.get("stability_weight_max", 0.50)
+LOAD_RISK_THRESHOLD = _ABLATION.get("risk_threshold", 1.15)
 LOAD_RISK_SLOPE = 5.0
 TASK_ENERGY_RATIO = 0.8
+TERMINATION_PENALTY_SCALE = -500.0
+BASE_CONTACT_PENALTY_SCALE = -5.0
 _POLICY_CLASS_NAME = "TerrainMoeActorCritic"
 _USE_PRETRAINED_INIT = _ABLATION.get("pretrained", True)
 PRETRAINED_BASE_CHECKPOINT = (
@@ -147,8 +156,10 @@ PRETRAINED_BASE_CHECKPOINT = (
     if _USE_PRETRAINED_INIT
     else ""
 )
-PRETRAINED_POLICY_FINETUNE_MODE = "partial"
-EXPERT_FREEZE = True
+PRETRAINED_POLICY_FINETUNE_MODE = _ABLATION.get(
+    "finetune_mode", "partial"
+)
+EXPERT_FREEZE = _ABLATION.get("expert_freeze", True)
 GATE_LR_MULTIPLIER = 0.25
 ADAPTER_LR_MULTIPLIER = 0.25
 ACTOR_LR_MULTIPLIER = 1.0
@@ -287,6 +298,7 @@ class Go2ArmRoughCfg( LeggedRobotCfg ):
 
         class trajectory_curriculum:
             enabled = ARM_TRAJECTORY_CURRICULUM
+            fixed_default_warmup_iters = 1000
             min_iterations = (0, 200, 500, 1000)
             min_success_rate = 0.6
             min_stability_rate = 0.6
@@ -431,6 +443,12 @@ class Go2ArmRoughCfg( LeggedRobotCfg ):
         # measured_points_x = [-0.3, -0.2, -0.1, 0., 0.1, 0.2, 0.3] # 1mx1.6m rectangle (without center line)
         # measured_points_y = [-0.3, -0.2, -0.1, 0., 0.1, 0.2, 0.3]
 
+    class termination:
+        # Require sustained base contact instead of terminating on a single
+        # rough-terrain scrape.
+        base_contact_force_threshold = 1.0  # [N]
+        base_contact_persist_steps = 3
+
 
     class commands( LeggedRobotCfg.commands ):
             curriculum = False
@@ -474,6 +492,10 @@ class Go2ArmRoughCfg( LeggedRobotCfg ):
             energy__dof_acc = -2.5e-7
             energy__action_rate = -0.01
             energy__smoothness = -0.01
+
+            # Shared safety terms for the complete formal ablation protocol.
+            termination = TERMINATION_PENALTY_SCALE
+            stab__base_contact = BASE_CONTACT_PENALTY_SCALE
 
         only_positive_rewards = False # if true negative total rewards are clipped at zero (avoids early termination problems)
         tracking_sigma = 0.25 # tracking reward = exp(-error^2/sigma)

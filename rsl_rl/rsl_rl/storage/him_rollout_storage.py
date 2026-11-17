@@ -41,6 +41,8 @@ class HIMRolloutStorage:
             self.actions = None
             self.rewards = None
             self.dones = None
+            self.timeouts = None
+            self.timeout_bootstrap_values = None
             self.values = None
             self.actions_log_prob = None
             self.action_mean = None
@@ -89,6 +91,12 @@ class HIMRolloutStorage:
         self.rewards = torch.zeros(num_transitions_per_env, num_envs, value_dim, device=self.device)
         self.actions = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
         self.dones = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device).byte()
+        self.timeouts = torch.zeros(
+            num_transitions_per_env, num_envs, device=self.device
+        ).bool()
+        self.timeout_bootstrap_values = torch.zeros(
+            num_transitions_per_env, num_envs, value_dim, device=self.device
+        )
 
         # For PPO
         self.actions_log_prob = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
@@ -96,6 +104,11 @@ class HIMRolloutStorage:
         self.returns = torch.zeros(num_transitions_per_env, num_envs, value_dim, device=self.device)
         self.advantages = torch.zeros(num_transitions_per_env, num_envs, value_dim, device=self.device)
         self.fused_advantages = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
+        self.raw_advantage_std = torch.zeros(value_dim, device=self.device)
+        self.fused_advantage_std = torch.zeros(1, device=self.device)
+        self.fused_advantage_component_rms = torch.zeros(
+            value_dim, device=self.device
+        )
         self.mu = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
         self.sigma = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
         if value_dim > 1:
@@ -105,6 +118,7 @@ class HIMRolloutStorage:
             self.load_weights = torch.zeros(
                 num_transitions_per_env, num_envs, value_dim, device=self.device
             )
+            self.actual_load_weights = torch.zeros_like(self.load_weights)
             self.previous_load_weights = torch.zeros_like(self.load_weights)
             self.load_weight_smooth_mask = torch.zeros(
                 num_transitions_per_env, num_envs, 1, device=self.device
@@ -112,6 +126,7 @@ class HIMRolloutStorage:
         else:
             self.payload_predictions = None
             self.load_weights = None
+            self.actual_load_weights = None
             self.previous_load_weights = None
             self.load_weight_smooth_mask = None
 
@@ -129,6 +144,14 @@ class HIMRolloutStorage:
         self.actions[self.step].copy_(transition.actions)
         self.rewards[self.step].copy_(transition.rewards.view(-1, self.value_dim))
         self.dones[self.step].copy_(transition.dones.view(-1, 1))
+        if transition.timeouts is not None:
+            self.timeouts[self.step].copy_(
+                transition.timeouts.reshape(-1)
+            )
+        if transition.timeout_bootstrap_values is not None:
+            self.timeout_bootstrap_values[self.step].copy_(
+                transition.timeout_bootstrap_values
+            )
         self.values[self.step].copy_(transition.values)
         self.actions_log_prob[self.step].copy_(transition.actions_log_prob.view(-1, 1))
         self.mu[self.step].copy_(transition.action_mean)
@@ -170,15 +193,30 @@ class HIMRolloutStorage:
                 next_values = last_values
             else:
                 next_values = self.values[step + 1]
-            next_is_not_terminal = 1.0 - self.dones[step].float()
-            delta = self.rewards[step] + next_is_not_terminal * gamma * next_values - self.values[step]
-            advantage = delta + next_is_not_terminal * gamma * lam * advantage
+            timeout = self.timeouts[step].unsqueeze(-1)
+            next_values = torch.where(
+                timeout,
+                self.timeout_bootstrap_values[step],
+                next_values,
+            )
+            continues = (
+                (1.0 - self.dones[step].float()).bool() | timeout
+            ).float()
+            delta = (
+                self.rewards[step]
+                + continues * gamma * next_values
+                - self.values[step]
+            )
+            advantage = delta + continues * gamma * lam * advantage
             self.returns[step] = advantage + self.values[step]
 
         # Compute and normalize the advantages.
         # 逐头在整个 rollout 上分别标准化：多评论家下各组奖励量级差几十倍也不影响，
         # λ 因此只表达相对重要性。value_dim=1 时与原来的全局归一化完全等价。
         self.advantages = self.returns - self.values
+        self.raw_advantage_std.copy_(
+            self.advantages.std(dim=(0, 1))
+        )
         mean = self.advantages.mean(dim=(0, 1), keepdim=True)
         std = self.advantages.std(dim=(0, 1), keepdim=True)
         self.advantages = (self.advantages - mean) / (std + 1e-8)
@@ -187,6 +225,12 @@ class HIMRolloutStorage:
         """Fuse normalized critic advantages with rollout-time weights."""
         if self.value_dim == 1:
             self.fused_advantages = self.advantages
+            self.fused_advantage_std.copy_(
+                self.fused_advantages.std(unbiased=False).reshape(1)
+            )
+            self.fused_advantage_component_rms.copy_(
+                self.fused_advantages.pow(2).mean().sqrt().reshape(1)
+            )
             return self.fused_advantages
         if self.load_weights is not None and self.load_weights.abs().sum() > 0:
             weights = self.load_weights
@@ -200,9 +244,17 @@ class HIMRolloutStorage:
                 "Multi-critic advantage fusion requires load weights or "
                 "fallback critic weights"
             )
-        self.fused_advantages = (
-            self.advantages * weights
-        ).sum(dim=-1, keepdim=True)
+        self.actual_load_weights.copy_(weights)
+        weighted_components = self.advantages * weights
+        self.fused_advantage_component_rms.copy_(
+            weighted_components.pow(2).mean(dim=(0, 1)).sqrt()
+        )
+        self.fused_advantages = weighted_components.sum(
+            dim=-1, keepdim=True
+        )
+        self.fused_advantage_std.copy_(
+            self.fused_advantages.std(unbiased=False).reshape(1)
+        )
         return self.fused_advantages
 
     def get_statistics(self):
@@ -235,7 +287,7 @@ class HIMRolloutStorage:
         old_mu = self.mu.flatten(0, 1)
         old_sigma = self.sigma.flatten(0, 1)
         if self.load_weights is not None:
-            load_weights = self.load_weights.flatten(0, 1)
+            load_weights = self.actual_load_weights.flatten(0, 1)
             previous_load_weights = self.previous_load_weights.flatten(0, 1)
             load_weight_smooth_mask = self.load_weight_smooth_mask.flatten(0, 1)
             payload_predictions = self.payload_predictions.flatten(0, 1)

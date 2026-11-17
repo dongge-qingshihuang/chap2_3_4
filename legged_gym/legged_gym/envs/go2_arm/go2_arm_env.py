@@ -93,6 +93,19 @@ class Go2ArmEnv(BaseTask):
         self.arm_control_dof_slice = slice(12, 18)   # 前 6 个可控关节
         self.gripper_dof_slice = slice(18, 20)       # 后 2 个夹爪固定
         self.keep_arm_fixed = self.cfg.control.keep_arm_fixed
+        trajectory_cfg = getattr(
+            self.cfg.arm, "trajectory_curriculum", None
+        )
+        self.arm_fixed_warmup_iters = int(
+            getattr(
+                trajectory_cfg,
+                "fixed_default_warmup_iters",
+                0,
+            )
+        )
+        self._arm_warmup_was_active = (
+            self.arm_fixed_warmup_iters > 0
+        )
         # 第三章 "rl"：q = q_current + Δq·action_scale；第四章 "ik_residual"：q = q_ik + Δq·residual_scale
         self.use_ik_control = getattr(self.cfg.arm.ik_control, "mode", "rl") == "ik_residual"
         self.ik_obs_dim = int(getattr(self.cfg.arm.ik_control, "obs_dim", 0))
@@ -877,6 +890,9 @@ class Go2ArmEnv(BaseTask):
     def _resample_arm_commands(self, env_ids, use_traj=True):
         if len(env_ids) == 0:
             return
+        if not self._arm_motion_enabled():
+            self._set_default_arm_command(env_ids)
+            return
 
         curriculum = getattr(self, "arm_trajectory_curriculum", None)
         if curriculum is not None and curriculum.enabled:
@@ -1225,7 +1241,7 @@ class Go2ArmEnv(BaseTask):
         self.reset_idx(env_ids)
 
         # --- 事件驱动重采样：settle 的 env 立即换新目标（reset 的 env 已在 reset_idx 处理）---
-        if not self.keep_arm_fixed:
+        if self._arm_motion_enabled():
             settled_ids = (self.settle_buf & ~self.reset_buf).nonzero(as_tuple=False).flatten()
             if len(settled_ids) > 0:
                 if curriculum is not None and curriculum.enabled:
@@ -1274,14 +1290,15 @@ class Go2ArmEnv(BaseTask):
         if self.viewer and self.enable_viewer_sync and self.debug_viz:
             self._draw_debug_vis()
 
+        # Publish the current-step mask even when no environment resets.
+        if self.cfg.env.send_timeouts:
+            self.extras["time_outs"] = self.time_out_buf.clone()
         return env_ids, termination_privileged_obs
 
     def check_termination(self):
         """ Check if environments need to be reset
         """
         self.reset_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-        self.time_out_buf = self.episode_length_buf > self.max_episode_length # no terminal reward for time-outs
-        self.reset_buf |= self.time_out_buf
 
         self.reverse_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device, requires_grad=False)        
         rpy = quaternion_to_rpy(self.base_quat)
@@ -1299,11 +1316,73 @@ class Go2ArmEnv(BaseTask):
         bad_roll  = torch.abs(self.roll)  > roll_th
         bad_pitch = torch.abs(self.pitch) > pitch_th
 
-        self.reset_buf |= (bad_roll | bad_pitch)
+        termination_cfg = self.cfg.termination
+        if self.termination_contact_indices.numel() > 0:
+            contact_force = torch.norm(
+                self.contact_forces[
+                    :, self.termination_contact_indices, :
+                ],
+                p=2,
+                dim=-1,
+            )
+            self.base_contact_buf = torch.any(
+                contact_force
+                > float(termination_cfg.base_contact_force_threshold),
+                dim=1,
+            )
+        else:
+            self.base_contact_buf.zero_()
+        self.base_contact_counter = torch.where(
+            self.base_contact_buf,
+            self.base_contact_counter + 1,
+            torch.zeros_like(self.base_contact_counter),
+        )
+        self.base_contact_termination_buf = (
+            self.base_contact_counter
+            >= int(termination_cfg.base_contact_persist_steps)
+        )
+        self.current_base_height = self._get_base_heights()
+
+        hard_fall = (
+            bad_roll
+            | bad_pitch
+            | self.base_contact_termination_buf
+        )
+        self.roll_termination_buf.copy_(bad_roll)
+        self.pitch_termination_buf.copy_(bad_pitch)
+        self.fall_termination_buf.copy_(hard_fall)
+        # Timeout is a truncation, not a physical terminal state. A fall on
+        # the same step takes precedence and must not bootstrap.
+        self.time_out_buf = (
+            self.episode_length_buf >= self.max_episode_length
+        ) & ~hard_fall
+        self.reset_buf = hard_fall | self.time_out_buf
 
         # if(self.ppo_it>self.cfg.arm.curriculum_iters[0]):
         #     self.body_height_buf = torch.mean(self.root_states[:, 2].unsqueeze(1) - self.measured_heights, dim=1) < 0.23
         #     self.reset_buf = torch.logical_or(self.body_height_buf, self.reset_buf)
+
+    def _arm_warmup_active(self):
+        return (
+            self.arm_fixed_warmup_iters > 0
+            and self.ppo_it < self.arm_fixed_warmup_iters
+        )
+
+    def _arm_motion_enabled(self):
+        return (
+            not self.keep_arm_fixed
+            and not self._arm_warmup_active()
+        )
+
+    def _set_default_arm_command(self, env_ids):
+        if len(env_ids) == 0:
+            return
+        q6 = self.default_dof_pos[
+            :, self.arm_control_dof_slice
+        ].expand(len(env_ids), -1)
+        self._set_arm_commands_from_q(
+            env_ids, q6, use_traj=False
+        )
 
     def _keep_arm_fixed(self):
         arm_start = 12  # 前12是狗，后8是臂
@@ -1325,6 +1404,8 @@ class Go2ArmEnv(BaseTask):
         Args:
             env_ids (list[int]): List of environment ids which must be reset
         """
+        # Never expose episode statistics from a previous reset step.
+        self.extras.pop("episode", None)
         if len(env_ids) == 0:
             return
         curriculum = getattr(self, "arm_trajectory_curriculum", None)
@@ -1367,9 +1448,11 @@ class Go2ArmEnv(BaseTask):
 
 
         self._resample_commands(env_ids)
-        if not self.keep_arm_fixed:
+        if self._arm_motion_enabled():
             # reset 时直接给静态目标（臂从默认姿态起步，不走轨迹）
             self._resample_arm_commands(env_ids, use_traj=False)
+        else:
+            self._set_default_arm_command(env_ids)
 
         # 逆解热启动重置为默认臂姿，避免沿用上一回合的解
         self.arm_q_ik[env_ids] = self.default_dof_pos[:, self.arm_control_dof_slice]
@@ -1393,6 +1476,8 @@ class Go2ArmEnv(BaseTask):
 
         self.last_dof_vel[env_ids] = 0.
         self.feet_air_time[env_ids] = 0.
+        self.base_contact_buf[env_ids] = False
+        self.base_contact_counter[env_ids] = 0
         self.reset_buf[env_ids] = 1
         self.obs_buf[env_ids] = 0.
 
@@ -1432,6 +1517,29 @@ class Go2ArmEnv(BaseTask):
         self.extras["episode"]["arm_settle_per_s"] = torch.mean(self.episode_settle_count[env_ids] / (ep_len * self.dt))
         self.extras["episode"]["arm_pos_tol"] = self.settle_pos_tol
         self.extras["episode"]["arm_ori_tol"] = self.settle_ori_tol
+        self.extras["episode"]["arm_warmup_active"] = float(
+            self._arm_warmup_active()
+        )
+        self.extras["episode"]["base_contact_termination_rate"] = torch.mean(
+            self.base_contact_termination_buf[env_ids].float()
+        )
+        self.extras["episode"]["roll_termination_rate"] = torch.mean(
+            self.roll_termination_buf[env_ids].float()
+        )
+        self.extras["episode"]["pitch_termination_rate"] = torch.mean(
+            self.pitch_termination_buf[env_ids].float()
+        )
+        self.extras["episode"]["fall_termination_rate"] = torch.mean(
+            self.fall_termination_buf[env_ids].float()
+        )
+        self.extras["episode"]["timeout_rate"] = torch.mean(
+            self.time_out_buf[env_ids].float()
+        )
+        self.extras["episode"]["base_height"] = torch.mean(
+            self.current_base_height[env_ids]
+        )
+        self.extras["episode"]["_episode_count"] = int(len(env_ids))
+        self.base_contact_termination_buf[env_ids] = False
         self.episode_pos_err_sum[env_ids] = 0.
         self.episode_ori_err_sum[env_ids] = 0.
         self.episode_settle_count[env_ids] = 0.
@@ -1574,6 +1682,13 @@ class Go2ArmEnv(BaseTask):
     def _update_arm_settle(self):
         """每步 reward 之前调用：更新 settle 计数与本步 potential"""
         self._update_arm_err_norms()
+
+        if not self._arm_motion_enabled():
+            self.arm_settle_counter.zero_()
+            self.settle_buf.zero_()
+            self.arm_potential_now[:] = self._arm_potential_fn()
+            self.arm_pbrs_skip[:] = True
+            return
 
         in_pos = self.arm_pos_err_norm < self.settle_pos_tol
         in_ori = self.arm_ori_err_norm < self.settle_ori_tol
@@ -1788,12 +1903,26 @@ class Go2ArmEnv(BaseTask):
         """ Callback called before computing terminations, rewards, and observations
             Default behaviour: Compute ang vel command based on target and heading, compute measured terrain heights and randomly push robots
         """
+        warmup_active = self._arm_warmup_active()
+        if (
+            not self.keep_arm_fixed
+            and self._arm_warmup_was_active
+            and not warmup_active
+        ):
+            all_ids = torch.arange(
+                self.num_envs, device=self.device
+            )
+            self._resample_arm_commands(all_ids)
+            self.arm_settle_counter.zero_()
+            self.arm_pbrs_skip[:] = True
+        self._arm_warmup_was_active = warmup_active
+
         # 
         env_ids = (self.episode_length_buf % int(self.cfg.commands.resampling_time / self.dt)==0).nonzero(as_tuple=False).flatten()
 
         # ② 再 resample 新目标
         self._resample_commands(env_ids)
-        if not self.keep_arm_fixed:
+        if self._arm_motion_enabled():
             self._resample_arm_commands(env_ids)
             if len(env_ids) > 0:
                 # 定时重采样发生在 reward 之前：本步 PBRS 口径不一致，置零跳过
@@ -1801,7 +1930,11 @@ class Go2ArmEnv(BaseTask):
                 self.arm_pbrs_skip[env_ids] = True
 
         # 每步推进局部轨迹参考（命令从起点平滑移向终点）
-        if not self.keep_arm_fixed and self.use_arm_traj and self.command_source != "random":
+        if (
+            self._arm_motion_enabled()
+            and self.use_arm_traj
+            and self.command_source != "random"
+        ):
             self._advance_arm_trajectory()
 
         self.contact_mask = self.contact_forces[:, self.feet_indices, 2] > 5.
@@ -1873,7 +2006,7 @@ class Go2ArmEnv(BaseTask):
         # -------------------------
         # arm torques: fixed trajectory target executed by PD
         # -------------------------
-        if self.keep_arm_fixed:
+        if not self._arm_motion_enabled():
             arm_target = self.default_dof_pos[:, self.arm_dof_slice].expand(self.num_envs, -1)
             arm_target_vel = torch.zeros_like(arm_target)
         else:
@@ -2157,6 +2290,27 @@ class Go2ArmEnv(BaseTask):
         self.commands_scale = torch.tensor([self.obs_scales.lin_vel, self.obs_scales.lin_vel, self.obs_scales.ang_vel], device=self.device, requires_grad=False,) # TODO change this
         self.feet_air_time = torch.zeros(self.num_envs, self.feet_indices.shape[0], dtype=torch.float, device=self.device, requires_grad=False)
         self.last_contacts = torch.zeros(self.num_envs, len(self.feet_indices), dtype=torch.bool, device=self.device, requires_grad=False)
+        self.base_contact_buf = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
+        self.base_contact_counter = torch.zeros(
+            self.num_envs, dtype=torch.long, device=self.device
+        )
+        self.base_contact_termination_buf = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
+        self.roll_termination_buf = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
+        self.pitch_termination_buf = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
+        self.fall_termination_buf = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
+        self.current_base_height = torch.zeros(
+            self.num_envs, device=self.device
+        )
 
 
         ###
@@ -3003,6 +3157,17 @@ class Go2ArmEnv(BaseTask):
     def _reward_action_rate(self):
         return torch.sum(
             torch.square(self.last_actions - self.actions), dim=1
+        )
+
+    def _reward_base_contact(self):
+        """Indicate sustained-contact onset on the base or other hard bodies."""
+        return self.base_contact_buf.float()
+
+    def _reward_termination(self):
+        """Terminal indicator for physical failures, excluding pure timeouts."""
+        return (
+            self.reset_buf.float()
+            * (~self.time_out_buf).float()
         )
 
     def _reward_smoothness(self):

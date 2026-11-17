@@ -25,19 +25,81 @@ def main():
     assert env.num_obs == 900
     assert env.num_privileged_obs == 251
     assert runner.alg.value_dim == 3
+    assert env.arm_fixed_warmup_iters == 1000
+    env.ppo_it = env.arm_fixed_warmup_iters - 1
+    assert env._arm_warmup_active()
+    assert not env._arm_motion_enabled()
+    env.ppo_it = env.arm_fixed_warmup_iters
+    assert not env._arm_warmup_active()
+    assert env._arm_motion_enabled()
+    env.ppo_it = 0
     indexed_height = env._get_base_heights(
         torch.tensor([0], device=env.device)
     )
     assert indexed_height.numel() == 1
+
+    # Pure timeout at exactly max_episode_length.
+    env.episode_length_buf.fill_(env.max_episode_length)
+    env.base_quat.zero_()
+    env.base_quat[:, 3] = 1.0
+    env.base_contact_counter.zero_()
+    env.contact_forces.zero_()
+    env.check_termination()
+    assert env.time_out_buf.all()
+    assert env.reset_buf.all()
+
+    # Fall has priority over timeout on the same step.
+    env.episode_length_buf.fill_(env.max_episode_length)
+    env.base_quat.zero_()
+    env.base_quat[:, 0] = 2 ** -0.5
+    env.base_quat[:, 3] = 2 ** -0.5
+    env.check_termination()
+    assert env.reset_buf.all()
+    assert not env.time_out_buf.any()
+
+    # Sustained base contact terminates even when orientation is valid.
+    env.episode_length_buf.zero_()
+    env.base_quat.zero_()
+    env.base_quat[:, 3] = 1.0
+    env.contact_forces.zero_()
+    env.base_contact_counter.fill_(
+        env.cfg.termination.base_contact_persist_steps - 1
+    )
+    env.contact_forces[
+        :, env.termination_contact_indices, 2
+    ] = -env.cfg.termination.base_contact_force_threshold * 2.0
+    env.check_termination()
+    assert env.base_contact_termination_buf.all()
+    assert env.reset_buf.all()
+    assert not env.time_out_buf.any()
+    assert abs(
+        env.reward_scales["termination"] + 500.0 * env.dt
+    ) < 1e-8
+    assert abs(
+        env.reward_scales["stab__base_contact"] + 5.0 * env.dt
+    ) < 1e-8
+    assert env._reward_termination().all()
+    assert env._reward_base_contact().all()
 
     # Resetting an environment must prevent history leakage across episodes.
     for frame in env.dog_obs_history:
         frame[0] = 1.0
     env.reset_idx(torch.tensor([0], device=env.device))
     assert all(not frame[0].any() for frame in env.dog_obs_history)
+    assert "episode" in env.extras
+    for key in (
+        "roll_termination_rate",
+        "pitch_termination_rate",
+        "fall_termination_rate",
+        "timeout_rate",
+        "arm_warmup_active",
+    ):
+        assert key in env.extras["episode"]
+    env.reset_idx(torch.tensor([], dtype=torch.long, device=env.device))
+    assert "episode" not in env.extras
 
     observations, critic_observations = env.reset()
-    for _ in range(runner.num_steps_per_env):
+    for step_index in range(runner.num_steps_per_env):
         actions = runner.alg.act(observations, critic_observations)
         (
             observations,
@@ -48,6 +110,8 @@ def main():
             termination_ids,
             termination_privileged,
         ) = env.step(actions)
+        assert "time_outs" in infos
+        assert infos["time_outs"].shape == (env.num_envs,)
         critic_observations = privileged.to(env.device)
         rewards = rewards.to(env.device)
         dones = dones.to(env.device)

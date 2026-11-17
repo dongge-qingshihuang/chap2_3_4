@@ -58,6 +58,26 @@ class LoadAwareWeightTest(unittest.TestCase):
         expected_ratio = high[0, 0] / (high[0, 0] + high[0, 2])
         self.assertAlmostEqual(expected_ratio.item(), 0.8, places=5)
 
+    def test_candidate_prior_has_usable_dynamic_range(self):
+        low_state = torch.zeros(1, 9)
+        low_state[0, 2] = 1.13
+        high_state = torch.zeros(1, 9)
+        high_state[0, 2] = 1.73
+        low = physical_prior_weights(
+            low_state,
+            stability_max=0.50,
+            risk_threshold=1.15,
+        )["weights"]
+        high = physical_prior_weights(
+            high_state,
+            stability_max=0.50,
+            risk_threshold=1.15,
+        )["weights"]
+        self.assertGreater(high[0, 1], low[0, 1])
+        self.assertGreater(low[0, 1], 0.30)
+        self.assertLess(high[0, 1], 0.50)
+        self.assertGreater(high[0, 1] - low[0, 1], 0.10)
+
 
 class MultiCriticGradientTest(unittest.TestCase):
     def setUp(self):
@@ -226,6 +246,14 @@ class RolloutStorageTest(unittest.TestCase):
             expected_returns[step, 0] = advantage + values[step, 0]
 
         expected_advantages = expected_returns - values
+        expected_raw_std = expected_advantages.std(dim=(0, 1))
+        self.assertTrue(
+            torch.allclose(
+                storage.raw_advantage_std,
+                expected_raw_std,
+                atol=1e-6,
+            )
+        )
         expected_advantages = (
             expected_advantages - expected_advantages.mean(dim=(0, 1), keepdim=True)
         ) / (expected_advantages.std(dim=(0, 1), keepdim=True) + 1e-8)
@@ -239,6 +267,39 @@ class RolloutStorageTest(unittest.TestCase):
         ).sum(dim=-1, keepdim=True)
         self.assertTrue(
             torch.allclose(storage.fused_advantages, expected_fused, atol=1e-7)
+        )
+        expected_component_rms = (
+            (storage.advantages * weights)
+            .pow(2)
+            .mean(dim=(0, 1))
+            .sqrt()
+        )
+        self.assertTrue(
+            torch.allclose(
+                storage.fused_advantage_component_rms,
+                expected_component_rms,
+                atol=1e-7,
+            )
+        )
+        self.assertAlmostEqual(
+            storage.fused_advantage_std.item(),
+            expected_fused.std(unbiased=False).item(),
+            places=6,
+        )
+        self.assertTrue(
+            torch.allclose(
+                storage.actual_load_weights,
+                weights.expand_as(storage.actual_load_weights),
+                atol=1e-7,
+            )
+        )
+        batch = next(storage.mini_batch_generator(1, 1))
+        self.assertTrue(
+            torch.allclose(
+                batch[11],
+                weights.reshape(-1).expand(steps * envs, value_dim),
+                atol=1e-7,
+            )
         )
         self.assertNotEqual(
             storage.advantages[0, 0, 0],

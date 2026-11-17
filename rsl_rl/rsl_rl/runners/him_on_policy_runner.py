@@ -354,8 +354,12 @@ class HIMOnPolicyRunner:
                     self.alg.process_env_step(step_rewards, dones, infos, next_critic_obs)
 
                     if self.log_dir is not None:
-                        if 'episode' in infos:
-                            ep_infos.append(infos['episode'])
+                        episode_info = infos.get('episode')
+                        if (
+                            episode_info
+                            and int(episode_info.get('_episode_count', 0)) > 0
+                        ):
+                            ep_infos.append(episode_info)
                         cur_reward_sum += rewards
                         cur_episode_length += 1
                         new_ids = (dones > 0).nonzero(as_tuple=False)
@@ -383,12 +387,52 @@ class HIMOnPolicyRunner:
 
             if self.log_dir is not None:
                 self.log(locals())
-            if it % self.save_interval == 0:
-                self.save(os.path.join(self.log_dir, f'model_{it}.pt'))
+            self.current_learning_iteration = it + 1
+            if self.current_learning_iteration % self.save_interval == 0:
+                self.save(
+                    os.path.join(
+                        self.log_dir,
+                        f'model_{self.current_learning_iteration}.pt',
+                    )
+                )
             ep_infos.clear()
 
-        self.current_learning_iteration += num_learning_iterations
         self.save(os.path.join(self.log_dir, f'model_{self.current_learning_iteration}.pt'))
+
+    @staticmethod
+    def _aggregate_episode_infos(ep_infos):
+        """Weight batch means by the number of episodes that produced them."""
+        if not ep_infos:
+            return {}
+        keys = sorted(
+            {
+                key
+                for info in ep_infos
+                for key in info
+                if not key.startswith("_")
+            }
+        )
+        metrics = {}
+        for key in keys:
+            weighted_sum = None
+            total_weight = 0
+            for info in ep_infos:
+                if key not in info:
+                    continue
+                count = int(info.get("_episode_count", 1))
+                value = torch.as_tensor(
+                    info[key], dtype=torch.float32
+                ).reshape(-1)
+                contribution = value.sum() * count
+                weighted_sum = (
+                    contribution
+                    if weighted_sum is None
+                    else weighted_sum + contribution
+                )
+                total_weight += count
+            if weighted_sum is not None and total_weight > 0:
+                metrics[key] = weighted_sum / total_weight
+        return metrics
 
     def log(self, locs, width=80, pad=35):
         self.tot_timesteps += self.num_steps_per_env * self.env.num_envs
@@ -397,16 +441,10 @@ class HIMOnPolicyRunner:
 
         ep_string = f''
         if locs['ep_infos']:
-            for key in locs['ep_infos'][0]:
-                infotensor = torch.tensor([], device=self.device)
-                for ep_info in locs['ep_infos']:
-                    # handle scalar and zero dimensional tensor infos
-                    if not isinstance(ep_info[key], torch.Tensor):
-                        ep_info[key] = torch.Tensor([ep_info[key]])
-                    if len(ep_info[key].shape) == 0:
-                        ep_info[key] = ep_info[key].unsqueeze(0)
-                    infotensor = torch.cat((infotensor, ep_info[key].to(self.device)))
-                value = torch.mean(infotensor)
+            for key, value in self._aggregate_episode_infos(
+                locs['ep_infos']
+            ).items():
+                value = value.to(self.device)
                 self.writer.add_scalar('Episode/' + key, value, locs['it'])
                 ep_string += f"""{f'Mean episode {key}:':>{pad}} {value:.4f}\n"""
         mean_std = self.alg.actor_critic.std.mean()
@@ -439,6 +477,13 @@ class HIMOnPolicyRunner:
             "critic_advantage_std_0": "Critic/task_advantage_std",
             "critic_advantage_std_1": "Critic/stability_advantage_std",
             "critic_advantage_std_2": "Critic/energy_advantage_std",
+            "raw_advantage_std_0": "Critic/task_raw_advantage_std",
+            "raw_advantage_std_1": "Critic/stability_raw_advantage_std",
+            "raw_advantage_std_2": "Critic/energy_raw_advantage_std",
+            "fused_advantage_std": "Fusion/fused_advantage_std",
+            "fused_advantage_component_rms_0": "Fusion/task_component_rms",
+            "fused_advantage_component_rms_1": "Fusion/stability_component_rms",
+            "fused_advantage_component_rms_2": "Fusion/energy_component_rms",
             "payload_position_mse": "Payload/position_mse",
             "payload_torque_mse": "Payload/gravity_torque_mse",
             "payload_velocity_mse": "Payload/com_velocity_mse",
@@ -556,7 +601,7 @@ class HIMOnPolicyRunner:
             self.writer.add_scalar('Train/mean_reward/time', statistics.mean(locs['rewbuffer']), self.tot_time)
             self.writer.add_scalar('Train/mean_episode_length/time', statistics.mean(locs['lenbuffer']), self.tot_time)
 
-        str = f" \033[1m Learning iteration {locs['it']}/{self.current_learning_iteration + locs['num_learning_iterations']} \033[0m "
+        str = f" \033[1m Learning iteration {locs['it']}/{locs['tot_iter']} \033[0m "
 
         if len(locs['rewbuffer']) > 0:
             log_string = (f"""{'#' * width}\n"""
@@ -589,7 +634,7 @@ class HIMOnPolicyRunner:
                        f"""{'Iteration time:':>{pad}} {iteration_time:.2f}s\n"""
                        f"""{'Total time:':>{pad}} {self.tot_time:.2f}s\n"""
                        f"""{'ETA:':>{pad}} {self.tot_time / (locs['it'] + 1) * (
-                               locs['num_learning_iterations'] - locs['it']):.1f}s\n""")
+                               locs['tot_iter'] - locs['it']):.1f}s\n""")
         print(log_string)
 
     def save(self, path, infos=None):

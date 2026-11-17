@@ -269,8 +269,10 @@ class HIMPPO:
                     "Load-aware rollout did not produce fusion weights"
                 )
         # need to record obs and critic_obs before env.step()
-        self.transition.observations = obs
-        self.transition.critic_observations = critic_obs
+        # env.step() may reset and zero obs_buf in-place. Keep independent
+        # pre-action observations for this transition.
+        self.transition.observations = obs.detach().clone()
+        self.transition.critic_observations = critic_obs.detach().clone()
         return self.transition.actions
 
     def act_base(self, base_obs):
@@ -287,12 +289,20 @@ class HIMPPO:
         self.transition.next_critic_observations = next_critic_obs.clone()
         self.transition.rewards = rewards.clone()
         self.transition.dones = dones
-        # Bootstrapping on time outs
-        if 'time_outs' in infos:
-            # values 是 (N, value_dim)，rewards 单评论家下是 (N,)、多评论家下是 (N, value_dim)，
-            # 统一按 rewards 的形状对齐后再累加
-            bootstrap = self.gamma * self.transition.values * infos['time_outs'].unsqueeze(1).to(self.device)
-            self.transition.rewards += bootstrap.reshape(self.transition.rewards.shape)
+        time_outs = infos.get("time_outs")
+        if time_outs is None:
+            time_outs = torch.zeros_like(dones, dtype=torch.bool).reshape(-1)
+        else:
+            time_outs = time_outs.to(self.device).bool().reshape(-1)
+        self.transition.timeouts = time_outs
+        if time_outs.any():
+            self.transition.timeout_bootstrap_values = (
+                self.actor_critic.evaluate(next_critic_obs).detach()
+            )
+        else:
+            self.transition.timeout_bootstrap_values = torch.zeros_like(
+                self.transition.values
+            )
 
         # Record the transition
         self.storage.add_transitions(self.transition)
@@ -619,7 +629,10 @@ class HIMPPO:
                 for key in risk_sums:
                     risk_sums[key] += prior[key].mean().item()
 
-            if load_weights_batch is not None:
+            if (
+                load_weights_batch is not None
+                and load_weights_batch.abs().sum() > 0
+            ):
                 actual_weights = load_weights_batch
                 actual_weight_sums += actual_weights.mean(dim=0)
                 actual_weight_sq_sums += actual_weights.pow(2).mean(dim=0)
@@ -689,6 +702,29 @@ class HIMPPO:
             "gate_grad_norm": gate_grad_norm / updates,
             "total_fused_return": fused_return_sum / updates,
         }
+        raw_adv_std = getattr(
+            self.storage, "raw_advantage_std", None
+        )
+        if raw_adv_std is not None:
+            for index in range(self.value_dim):
+                self.last_update_stats[
+                    f"raw_advantage_std_{index}"
+                ] = raw_adv_std[index].item()
+        fused_adv_std = getattr(
+            self.storage, "fused_advantage_std", None
+        )
+        if fused_adv_std is not None:
+            self.last_update_stats["fused_advantage_std"] = (
+                fused_adv_std.reshape(-1)[0].item()
+            )
+        component_rms = getattr(
+            self.storage, "fused_advantage_component_rms", None
+        )
+        if component_rms is not None:
+            for index in range(self.value_dim):
+                self.last_update_stats[
+                    f"fused_advantage_component_rms_{index}"
+                ] = component_rms[index].item()
         for index in range(self.value_dim):
             self.last_update_stats[
                 f"critic_value_loss_{index}"

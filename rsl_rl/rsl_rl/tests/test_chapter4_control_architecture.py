@@ -5,6 +5,8 @@ import torch
 
 from rsl_rl.algorithms import HIMPPO
 from rsl_rl.modules import TerrainMoeActorCritic
+from rsl_rl.runners import HIMOnPolicyRunner
+from rsl_rl.storage import HIMRolloutStorage
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -213,6 +215,92 @@ class Chapter4PolicyTest(unittest.TestCase):
         self.assertEqual(tuple(actions.shape), (2, 12))
         self.assertEqual(tuple(model.get_payload_estimate().shape), (2, 9))
         self.assertEqual(tuple(model.get_load_weights().shape), (2, 3))
+
+    def test_ppo_act_keeps_pre_action_observation_copy(self):
+        model = self.build_trainable_model().configure_finetune("partial")
+        algorithm = HIMPPO(
+            model,
+            device="cpu",
+            value_dim=3,
+            load_aware_enabled=True,
+        )
+        observations = torch.randn(2, 900)
+        critic_observations = torch.randn(2, 251)
+        algorithm.act(observations, critic_observations)
+        stored_observations = algorithm.transition.observations
+        stored_critic = algorithm.transition.critic_observations
+        expected = observations.clone()
+        expected_critic = critic_observations.clone()
+        observations.zero_()
+        critic_observations.zero_()
+        self.assertTrue(torch.equal(stored_observations, expected))
+        self.assertTrue(torch.equal(stored_critic, expected_critic))
+        self.assertNotEqual(
+            observations.data_ptr(), stored_observations.data_ptr()
+        )
+
+
+class TimeoutBootstrapTest(unittest.TestCase):
+    def test_timeout_uses_terminal_next_value_and_next_step_is_normal(self):
+        storage = HIMRolloutStorage(
+            1, 2, [1], [1], [1], value_dim=1
+        )
+        storage.rewards[:, 0, 0] = torch.tensor([1.0, 2.0])
+        storage.values[:, 0, 0] = torch.zeros(2)
+        storage.dones[:, 0, 0] = torch.tensor([1, 0], dtype=torch.uint8)
+        storage.timeouts[:, 0] = torch.tensor([True, False])
+        storage.timeout_bootstrap_values[:, 0, 0] = torch.tensor([5.0, 0.0])
+        storage.compute_returns(
+            torch.zeros(1, 1), gamma=0.9, lam=0.8
+        )
+        expected_step1 = 2.0
+        expected_step0 = (
+            1.0
+            + 0.9 * 5.0
+            + 0.9 * 0.8 * expected_step1
+        )
+        self.assertAlmostEqual(
+            storage.returns[0, 0, 0].item(), expected_step0, places=6
+        )
+        self.assertAlmostEqual(
+            storage.returns[1, 0, 0].item(), expected_step1, places=6
+        )
+
+    def test_fall_does_not_bootstrap(self):
+        storage = HIMRolloutStorage(
+            1, 1, [1], [1], [1], value_dim=1
+        )
+        storage.rewards[0, 0, 0] = 1.0
+        storage.values[0, 0, 0] = 0.0
+        storage.dones[0, 0, 0] = 1
+        storage.timeouts[0, 0] = False
+        storage.timeout_bootstrap_values[0, 0, 0] = 99.0
+        storage.compute_returns(
+            torch.zeros(1, 1), gamma=0.9, lam=0.8
+        )
+        self.assertAlmostEqual(
+            storage.returns[0, 0, 0].item(), 1.0, places=6
+        )
+
+
+class EpisodeAggregationTest(unittest.TestCase):
+    def test_episode_batches_are_weighted_by_completed_count(self):
+        metrics = HIMOnPolicyRunner._aggregate_episode_infos(
+            [
+                {
+                    "_episode_count": 1,
+                    "rew_task": torch.tensor(2.0),
+                },
+                {
+                    "_episode_count": 99,
+                    "rew_task": torch.tensor(4.0),
+                },
+            ]
+        )
+        self.assertAlmostEqual(
+            metrics["rew_task"].item(), 3.98, places=6
+        )
+        self.assertNotIn("_episode_count", metrics)
 
 
 if __name__ == "__main__":
