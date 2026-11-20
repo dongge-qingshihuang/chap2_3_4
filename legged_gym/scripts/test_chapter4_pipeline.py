@@ -296,18 +296,12 @@ def main():
             torch.isfinite(torch.tensor(stats[f"actual_{name}_weight"]))
             for name in ("task", "stability", "energy")
         )
-    if runner.alg.actor_critic.base_action_residual_enabled:
+    if runner.cfg.get("freeze_pretrained_actor", False):
         assert runner.alg.actor_critic.actor[0].weight.grad is None
         assert runner.alg.actor_critic.control_gate[0].weight.grad is None
         assert (
             runner.alg.actor_critic.control_adapters[0][0].weight.grad
             is None
-        )
-        assert any(
-            parameter.grad is not None
-            for parameter in (
-                runner.alg.actor_critic.base_action_residual.parameters()
-            )
         )
     else:
         assert runner.alg.actor_critic.actor[0].weight.grad is not None
@@ -315,6 +309,13 @@ def main():
         assert (
             runner.alg.actor_critic.control_adapters[0][0].weight.grad
             is not None
+        )
+    if runner.alg.actor_critic.base_action_residual_enabled:
+        assert any(
+            parameter.grad is not None
+            for parameter in (
+                runner.alg.actor_critic.base_action_residual.parameters()
+            )
         )
     assert all(
         parameter.grad is None
