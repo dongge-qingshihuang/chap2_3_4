@@ -447,7 +447,8 @@ class HIMOnPolicyRunner:
                 value = value.to(self.device)
                 self.writer.add_scalar('Episode/' + key, value, locs['it'])
                 ep_string += f"""{f'Mean episode {key}:':>{pad}} {value:.4f}\n"""
-        mean_std = self.alg.actor_critic.std.mean()
+        std_values = self.alg.actor_critic.std.detach()
+        mean_std = std_values.mean()
         fps = int(self.num_steps_per_env * self.env.num_envs / (locs['collection_time'] + locs['learn_time']))
 
         self.writer.add_scalar('Loss/value_function', locs['mean_value_loss'], locs['it'])
@@ -502,6 +503,9 @@ class HIMOnPolicyRunner:
             "total_fused_return": "Critic/total_fused_return",
             "expert_gate_entropy": "Gate/expert_gate_entropy",
             "expert_gate_load_balance": "Gate/expert_load_balance",
+            "actor_entropy": "Policy/actor_entropy",
+            "actor_kl": "Policy/actor_kl",
+            "std_clamp_fraction": "Policy/std_clamp_fraction",
         }
         for source, destination in mapping.items():
             if source in update_stats:
@@ -592,6 +596,12 @@ class HIMOnPolicyRunner:
             if hasattr(self.env, 'pitch'):
                 self.writer.add_scalar('BaseResidual/base_pitch_abs', self.env.pitch.abs().mean().item(), locs['it'])
         self.writer.add_scalar('Policy/mean_noise_std', mean_std.item(), locs['it'])
+        self.writer.add_scalar(
+            'Policy/min_noise_std', std_values.min().item(), locs['it']
+        )
+        self.writer.add_scalar(
+            'Policy/max_noise_std', std_values.max().item(), locs['it']
+        )
         self.writer.add_scalar('Perf/total_fps', fps, locs['it'])
         self.writer.add_scalar('Perf/collection time', locs['collection_time'], locs['it'])
         self.writer.add_scalar('Perf/learning_time', locs['learn_time'], locs['it'])
@@ -737,12 +747,27 @@ class HIMOnPolicyRunner:
             # Rollout buffers may contain inference tensors under PyTorch 1.10.
             # Loading within inference mode permits their in-place copy.
             with torch.inference_mode():
-                self.obs_normalizer.load_state_dict(
-                    loaded_dict["obs_norm_state_dict"]
-                )
-                self.critic_obs_normalizer.load_state_dict(
-                    loaded_dict["critic_obs_norm_state_dict"]
-                )
+                if loaded_dict.get("obs_norm_state_dict") is not None:
+                    self.obs_normalizer.load_state_dict(
+                        loaded_dict["obs_norm_state_dict"]
+                    )
+                else:
+                    print(
+                        "[Normalization] checkpoint has no observation "
+                        "statistics; starting from identity"
+                    )
+                if (
+                    loaded_dict.get("critic_obs_norm_state_dict")
+                    is not None
+                ):
+                    self.critic_obs_normalizer.load_state_dict(
+                        loaded_dict["critic_obs_norm_state_dict"]
+                    )
+                else:
+                    print(
+                        "[Normalization] checkpoint has no critic "
+                        "statistics; starting from identity"
+                    )
         if self.train_base and 'base_residual_state_dict' in loaded_dict:
             self.base_residual.load_state_dict(loaded_dict['base_residual_state_dict'])
             if load_optimizer and 'base_optimizer_state_dict' in loaded_dict:

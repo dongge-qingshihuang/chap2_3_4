@@ -1500,15 +1500,14 @@ class Go2ArmEnv(BaseTask):
             self.extras["episode"]['rew_' + key] = torch.mean(self.episode_sums[key][env_ids] / torch.clip(self.episode_length_buf[env_ids], min=1) / self.dt)
             self.episode_sums[key][env_ids] = 0.
 
-        # 多评论家：分组奖励的 episode 均值，用于看三路各自的贡献
-        if self.value_dim > 1:
-            for g in self.reward_groups[:self.value_dim]:
-                self.extras["episode"]['rewgroup_' + g] = torch.mean(
-                    self.episode_sums_group[g][env_ids] / torch.clip(self.episode_length_buf[env_ids], min=1) / self.dt)
-                self.episode_sums_group[g][env_ids] = 0.
-        else:
-            for g in self.episode_sums_group:
-                self.episode_sums_group[g][env_ids] = 0.
+        # 分组奖励 episode 均值；单评论家也记录原始三组，便于公平比较。
+        for g in self.reward_groups:
+            self.extras["episode"]['rewgroup_' + g] = torch.mean(
+                self.episode_sums_group[g][env_ids]
+                / torch.clip(self.episode_length_buf[env_ids], min=1)
+                / self.dt
+            )
+            self.episode_sums_group[g][env_ids] = 0.
 
         # arm 跟踪硬指标：episode 平均误差 [m]/[rad]、settle 率 [次/s]、当前课程容差
         ep_len = torch.clip(self.episode_length_buf[env_ids], min=1).float()
@@ -1596,27 +1595,41 @@ class Go2ArmEnv(BaseTask):
         """
         self.rew_buf[:] = 0.
         self.rew_buf_vec[:] = 0.
+        group_rew = torch.zeros(
+            self.num_envs,
+            len(self.reward_groups),
+            device=self.device,
+        )
         for i in range(len(self.reward_functions)):
             name = self.reward_names[i]
             g = self.reward_group_idx[i]
             rew = self.reward_functions[i]() * self.reward_scales[name]
             self.rew_buf += rew
-            self.rew_buf_vec[:, g] += rew
+            group_rew[:, g] += rew
             self.episode_sums[name] += rew
             self.episode_sums_group[self.reward_groups[g]] += rew
         if self.cfg.rewards.only_positive_rewards:
             # 只对 task 组截断：stab / energy 本身就是代价项，截断会让它们失效
             self.rew_buf[:] = torch.clip(self.rew_buf[:], min=0.)
-            self.rew_buf_vec[:, 0] = torch.clip(self.rew_buf_vec[:, 0], min=0.)
+            group_rew[:, 0] = torch.clip(group_rew[:, 0], min=0.)
         # add termination reward after clipping
         if "termination" in self.reward_scales:
             rew = self._reward_termination() * self.reward_scales["termination"]
             self.rew_buf += rew
-            # 终止惩罚归入 stab 组（多评论家下），单评论家时仍落在唯一的那一列
-            g_term = 1 if self.value_dim > 1 else 0
-            self.rew_buf_vec[:, g_term] += rew
+            # 终止惩罚始终属于 stability 组。
+            g_term = self.reward_groups.index("stab")
+            group_rew[:, g_term] += rew
             self.episode_sums["termination"] += rew
             self.episode_sums_group[self.reward_groups[g_term]] += rew
+
+        if self.value_dim > 1:
+            self.rew_buf_vec[:, :] = group_rew[:, :self.value_dim]
+        else:
+            weighted = (
+                group_rew * self.reward_group_weights.unsqueeze(0)
+            ).sum(dim=-1)
+            self.rew_buf[:] = weighted
+            self.rew_buf_vec[:, 0] = weighted
     
     def compute_observations(self):
         self._refresh_ee_state()
@@ -2600,6 +2613,29 @@ class Go2ArmEnv(BaseTask):
         # prepare list of functions
         # 奖励项可用 "组名__函数名" 归组（如 stab__orientation）；无前缀的一律算 task，
         # 因此第三、四章的现有配置无需改动
+        group_weights = getattr(
+            self.cfg.rewards,
+            "single_critic_group_weights",
+            (0.7, 0.2, 0.1),
+        )
+        if len(group_weights) != len(self.reward_groups):
+            raise ValueError(
+                "single_critic_group_weights must match reward groups"
+            )
+        self.reward_group_weights = torch.tensor(
+            group_weights,
+            dtype=torch.float,
+            device=self.device,
+        )
+        if (
+            (self.reward_group_weights < 0).any()
+            or self.reward_group_weights.sum() <= 0
+        ):
+            raise ValueError(
+                "single_critic_group_weights must be non-negative "
+                "with a positive sum"
+            )
+        self.reward_group_weights /= self.reward_group_weights.sum()
         self.reward_functions = []
         self.reward_names = []
         self.reward_group_idx = []
@@ -2612,8 +2648,7 @@ class Go2ArmEnv(BaseTask):
                 group, base = name.split("__", 1)
             if group not in self.reward_groups:
                 raise ValueError(f"奖励 '{name}' 的组名 '{group}' 不在 {self.reward_groups} 中")
-            # 单评论家下所有组汇入唯一的那一路，这样带前缀的配置在两种模式下都能跑
-            g_idx = self.reward_groups.index(group) if self.value_dim > 1 else 0
+            g_idx = self.reward_groups.index(group)
             self.reward_names.append(name)
             self.reward_group_idx.append(g_idx)
             self.reward_functions.append(getattr(self, '_reward_' + base))
@@ -2627,7 +2662,7 @@ class Go2ArmEnv(BaseTask):
                                        device=self.device, requires_grad=False)
         self.episode_sums_group = {
             g: torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
-            for g in self.reward_groups[:self.value_dim]
+            for g in self.reward_groups
         }
 
         # 多评论家下空组会让对应的 critic 恒学 V=0、该路 advantage 恒为 0，
@@ -2729,6 +2764,7 @@ class Go2ArmEnv(BaseTask):
         self.num_bodies = len(body_names)
         self.num_dofs = len(self.dof_names)
         feet_names = [s for s in body_names if self.cfg.asset.foot_name in s]
+        self.foot_names = list(feet_names)
 
         ee_name = self.cfg.asset.ee_name   # 配置里加，比如 "gripper_link" / "tool0"
         ee_candidates = [i for i, n in enumerate(body_names) if ee_name in n]
@@ -3162,6 +3198,61 @@ class Go2ArmEnv(BaseTask):
     def _reward_base_contact(self):
         """Indicate sustained-contact onset on the base or other hard bodies."""
         return self.base_contact_buf.float()
+
+    def _reward_foot_spacing(self):
+        """Penalize a compact support polygon and insufficient inter-foot room."""
+        slots = {
+            name.split("_", 1)[0]: index
+            for index, name in enumerate(self.foot_names)
+        }
+        feet_xy = self.feet_pos[:, :, :2]
+        front_width = torch.norm(
+            feet_xy[:, slots["FL"]] - feet_xy[:, slots["FR"]], dim=-1
+        )
+        rear_width = torch.norm(
+            feet_xy[:, slots["RL"]] - feet_xy[:, slots["RR"]], dim=-1
+        )
+        pairs = (
+            ("FL", "FR"),
+            ("FL", "RL"),
+            ("FL", "RR"),
+            ("FR", "RL"),
+            ("FR", "RR"),
+            ("RL", "RR"),
+        )
+        minimum_distance = torch.stack(
+            [
+                torch.norm(
+                    feet_xy[:, slots[first]] - feet_xy[:, slots[second]],
+                    dim=-1,
+                )
+                for first, second in pairs
+            ],
+            dim=-1,
+        ).min(dim=-1).values
+        rewards_cfg = self.cfg.rewards
+        target_width = float(rewards_cfg.foot_spacing_target_width)
+        target_minimum = float(
+            rewards_cfg.foot_spacing_target_min_distance
+        )
+        # Convert metres to normalized shortfall so the scale is independent of
+        # the selected target.
+        front_deficit = torch.relu(
+            target_width - front_width
+        ) / target_width
+        rear_deficit = torch.relu(
+            target_width - rear_width
+        ) / target_width
+        minimum_deficit = torch.relu(
+            target_minimum - minimum_distance
+        ) / target_minimum
+        # Return a positive shortfall; the configured negative stability scale
+        # converts this into a penalty.
+        return (
+            front_deficit.pow(2)
+            + rear_deficit.pow(2)
+            + minimum_deficit.pow(2)
+        ) / 3.0
 
     def _reward_termination(self):
         """Terminal indicator for physical failures, excluding pure timeouts."""

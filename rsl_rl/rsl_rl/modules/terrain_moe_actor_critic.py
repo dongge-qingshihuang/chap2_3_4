@@ -1,4 +1,6 @@
 import copy
+import math
+from collections import OrderedDict
 
 import torch
 import torch.nn as nn
@@ -306,6 +308,8 @@ class TerrainMoeActorCritic(nn.Module):
         terrain_dim=187,
         activation="elu",
         init_noise_std=0.8,
+        min_noise_std=0.05,
+        max_noise_std=0.5,
         ema_tau=0.01,
         gate_rho=0.3,
         gate_type="mlp",
@@ -356,6 +360,16 @@ class TerrainMoeActorCritic(nn.Module):
         self.history_len = history_len
         self.num_modes = num_modes
         self.latent_dim = latent_dim
+        self.noise_std_min = float(min_noise_std)
+        self.noise_std_max = float(max_noise_std)
+        if not (
+            0.0 < self.noise_std_min
+            < self.noise_std_max
+        ):
+            raise ValueError(
+                "Require 0 < min_noise_std < max_noise_std, got "
+                f"{self.noise_std_min} and {self.noise_std_max}"
+            )
         if history_len * num_proprio != num_actor_obs:
             raise ValueError(
                 "num_actor_obs must equal history_len * num_proprio: "
@@ -542,7 +556,13 @@ class TerrainMoeActorCritic(nn.Module):
                 raise ValueError(
                     "load_aware_enabled=True requires three critics"
                 )
-        self.std = nn.Parameter(torch.ones(num_actions) * init_noise_std)
+        initial_std = min(
+            max(float(init_noise_std), self.noise_std_min),
+            self.noise_std_max,
+        )
+        self.log_std = nn.Parameter(
+            torch.full((num_actions,), math.log(initial_std))
+        )
         self.distribution = None
         self.last_perception = None
         self.last_payload_prediction = None
@@ -555,6 +575,10 @@ class TerrainMoeActorCritic(nn.Module):
         return self.distribution.mean
 
     @property
+    def std(self):
+        return self.log_std.exp()
+
+    @property
     def action_std(self):
         return self.distribution.stddev
 
@@ -564,6 +588,27 @@ class TerrainMoeActorCritic(nn.Module):
 
     def reset(self, dones=None):
         pass
+
+    @torch.no_grad()
+    def enforce_std_bounds(self):
+        lower = math.log(self.noise_std_min)
+        upper = math.log(self.noise_std_max)
+        clamped = (self.log_std < lower) | (self.log_std > upper)
+        self.log_std.clamp_(lower, upper)
+        return clamped.float().mean()
+
+    def load_state_dict(self, state_dict, strict=True):
+        """Load old ``std`` checkpoints into the bounded ``log_std`` parameter."""
+        state_dict = OrderedDict(state_dict)
+        if "std" in state_dict:
+            old_std = state_dict.pop("std")
+            if "log_std" not in state_dict:
+                bounded_std = old_std.detach().clamp(
+                    min=self.noise_std_min,
+                    max=self.noise_std_max,
+                )
+                state_dict["log_std"] = bounded_std.log()
+        return super().load_state_dict(state_dict, strict=strict)
 
     def _online_latents(self, history):
         latents = []
@@ -894,7 +939,7 @@ class TerrainMoeActorCritic(nn.Module):
             if module is not None:
                 for parameter in module.parameters():
                     parameter.requires_grad_(True)
-        self.std.requires_grad_(True)
+        self.log_std.requires_grad_(True)
         return self
 
     def get_payload_estimate(self):
@@ -916,7 +961,7 @@ class TerrainMoeActorCritic(nn.Module):
     def policy_parameter_groups(self):
         groups = [
             {
-                "params": list(self.actor.parameters()) + [self.std],
+                "params": list(self.actor.parameters()) + [self.log_std],
                 "lr_multiplier": self.actor_lr_multiplier,
                 "name": "actor",
             },
@@ -1022,6 +1067,9 @@ class TerrainMoeActorCritic(nn.Module):
             "use_ema": self.use_ema,
             "finetune_mode": self.finetune_mode,
             "num_critics": self.num_critics,
+            "action_noise_parameter": "log_std",
+            "noise_std_min": self.noise_std_min,
+            "noise_std_max": self.noise_std_max,
             "payload_dim": self.payload_dim,
             "load_aware_enabled": self.load_aware_enabled,
             "future_contact_steps": self.future_contact_steps,

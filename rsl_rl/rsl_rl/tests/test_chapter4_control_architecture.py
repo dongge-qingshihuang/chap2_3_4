@@ -88,6 +88,36 @@ class Chapter4PolicyTest(unittest.TestCase):
         self.assertEqual(tuple(actions.shape), (2, 12))
         self.assertTrue(torch.isfinite(actions).all())
 
+    def test_bounded_log_std_and_legacy_std_checkpoint(self):
+        model = self.build_trainable_model()
+        state = model.state_dict()
+        self.assertIn("log_std", state)
+        self.assertNotIn("std", state)
+        self.assertLessEqual(model.std.max().item(), 0.5)
+        self.assertGreaterEqual(model.std.min().item(), 0.05)
+
+        with torch.no_grad():
+            model.log_std.fill_(2.0)
+        clamp_fraction = model.enforce_std_bounds()
+        self.assertEqual(clamp_fraction.item(), 1.0)
+        self.assertTrue(
+            torch.allclose(
+                model.std,
+                torch.full_like(model.std, 0.5),
+            )
+        )
+
+        legacy_state = model.state_dict()
+        legacy_state.pop("log_std")
+        legacy_state["std"] = torch.tensor(
+            [0.001] + [2.0] * 11
+        )
+        model.load_state_dict(legacy_state, strict=True)
+        self.assertAlmostEqual(model.std[0].item(), 0.05, places=6)
+        self.assertTrue(
+            torch.allclose(model.std[1:], torch.full((11,), 0.5))
+        )
+
     def test_partial_freeze_and_gradients(self):
         model = self.build_trainable_model()
         model.configure_finetune(
@@ -204,6 +234,7 @@ class Chapter4PolicyTest(unittest.TestCase):
             for parameter in group["params"]
         }
         self.assertIn(id(model.actor[0].weight), ppo_ids)
+        self.assertIn(id(model.log_std), ppo_ids)
         self.assertNotIn(id(model.payload_estimator[0].weight), ppo_ids)
         self.assertIn(id(model.payload_estimator[0].weight), payload_ids)
         self.assertNotIn(id(model.load_weight_net.net[0].weight), ppo_ids)

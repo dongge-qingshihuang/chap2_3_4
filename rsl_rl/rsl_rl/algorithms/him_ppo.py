@@ -370,6 +370,10 @@ class HIMPPO:
         weight_kl_sum = 0.0
         weight_smooth_sum = 0.0
         fused_return_sum = 0.0
+        actor_entropy_sum = 0.0
+        actor_kl_sum = 0.0
+        actor_kl_count = 0
+        std_clamp_fraction_sum = 0.0
         expert_gate_sums = None
         expert_gate_sq_sums = None
         expert_gate_entropy_sum = 0.0
@@ -428,20 +432,23 @@ class HIMPPO:
                         expert_gate.detach()
                     ).mean().item()
 
-            # 2) adaptive KL（保留你原来的逻辑）
+            # 2) Actor distribution KL and optional adaptive learning rate.
+            with torch.inference_mode():
+                kl = torch.sum(
+                    torch.log((sigma_batch + 1e-8) / (old_sigma_batch + 1e-8))
+                    + (
+                        old_sigma_batch.pow(2)
+                        + (old_mu_batch - mu_batch).pow(2)
+                    ) / (2.0 * (sigma_batch.pow(2) + 1e-8))
+                    - 0.5,
+                    dim=-1
+                )
+                kl_mean = kl.mean()
+                actor_kl_sum += kl_mean.item()
+                actor_kl_count += 1
+
             if self.desired_kl is not None and self.schedule == "adaptive":
                 with torch.inference_mode():
-                    kl = torch.sum(
-                        torch.log((sigma_batch + 1e-8) / (old_sigma_batch + 1e-8))
-                        + (
-                            old_sigma_batch.pow(2)
-                            + (old_mu_batch - mu_batch).pow(2)
-                        ) / (2.0 * (sigma_batch.pow(2) + 1e-8))
-                        - 0.5,
-                        dim=-1
-                    )
-                    kl_mean = kl.mean()
-
                     if kl_mean > self.desired_kl * 2.0:
                         # 下限抬到 2e-4：std 退火后 σ 变小会让 KL 易爆，
                         # 原 1e-5 地板会导致后期 LR 触底、精度学不动
@@ -514,9 +521,20 @@ class HIMPPO:
             ).item()
             self.optimizer.step()
 
-            if hasattr(self.actor_critic, "log_std"):
+            enforce_std_bounds = getattr(
+                self.actor_critic, "enforce_std_bounds", None
+            )
+            if callable(enforce_std_bounds):
+                clamp_fraction = enforce_std_bounds()
+                std_clamp_fraction_sum += float(
+                    clamp_fraction.item()
+                )
+            elif hasattr(self.actor_critic, "log_std"):
                 with torch.no_grad():
-                    self.actor_critic.log_std.clamp_(math.log(1e-4), math.log(0.5))
+                    self.actor_critic.log_std.clamp_(
+                        math.log(1e-4), math.log(0.5)
+                    )
+            actor_entropy_sum += entropy_batch.mean().item()
 
             # 7) Payload supervision with a dedicated optimizer. The actor
             # consumes detached estimates, so this loss cannot update policy
@@ -701,6 +719,13 @@ class HIMPPO:
             "payload_grad_norm": payload_grad_norm / updates,
             "gate_grad_norm": gate_grad_norm / updates,
             "total_fused_return": fused_return_sum / updates,
+            "actor_entropy": actor_entropy_sum / updates,
+            "actor_kl": (
+                actor_kl_sum / max(actor_kl_count, 1)
+            ),
+            "std_clamp_fraction": (
+                std_clamp_fraction_sum / updates
+            ),
         }
         raw_adv_std = getattr(
             self.storage, "raw_advantage_std", None

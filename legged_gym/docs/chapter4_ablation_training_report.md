@@ -1,13 +1,12 @@
 # Chapter 4 Ablation Training Report
 
-Snapshot time: 2026-11-17 09:54 Asia/Shanghai
+Snapshot time: 2026-11-17 20:36 Asia/Shanghai
 
-> **Formal run status:** B0 and B1 completed all 8000 updates. B4 and B2 are
-> still running; B3 and B0F are pending. B1 is healthy, while B0 shows a severe
-> late-training collapse: action noise rose above 10, mean reward dropped to a
-> transient minimum below -600, and final task tracking/terrain progress fell
-> far behind B1. Numerical results from earlier provisional queues are retained
-> only as debugging baselines.
+> **Formal run status:** The first formal queue exposed an unbounded action
+> standard deviation and was stopped. It remains the failure-analysis baseline.
+> In the corrected bounded queue, B0 and B1 completed 8000 updates, while B4
+> and B2 are running. The bounded Actor prevents the previous variance
+> divergence.
 >
 > **Unified protocol:** every formal mode uses the calibrated load prior
 > (`1.15/0.50` where applicable), a 1000-update fixed-arm warmup,
@@ -30,19 +29,294 @@ Snapshot time: 2026-11-17 09:54 Asia/Shanghai
   `legged_gym/logs/chapter4_ablation_queue_safety_warmup`.
 - Formal run log root:
   `legged_gym/logs/chapter4_ablation_formal`.
+- Bounded rerun log root:
+  `legged_gym/logs/chapter4_ablation_formal_bounded`.
 
 ## Queue Status
 
 | Mode | Description | Status |
 |---|---|---|
-| B0 | Full method (`Ours`) | Finished, late-training collapse |
-| B1 | Single critic, no load prior | Finished, healthy |
+| B0 | Full method (`Ours`) | Finished, 8000 updates |
+| B1 | Single critic, equal fixed group weighting | Finished, 8000 updates |
 | B4 | No pretrained initialization | Running, intermediate |
 | B2 | No arm trajectory curriculum | Running, intermediate |
-| B3 | No load-aware fusion, fixed weights | Pending |
-| B0F | Pretrained control with B4's full unfreeze scope | Pending |
+| B3 | No dynamic fusion; payload estimation retained | Pending in bounded rerun |
+| B0F | Pretrained control with B4's full unfreeze scope | Pending in bounded rerun |
 
-## Formal Training Snapshot
+## P0 Correctness Fixes
+
+The previous formal multi-critic curves were invalidated by three issues:
+
+1. `TerrainMoeActorCritic` used a direct `std` parameter, while PPO only
+   clamped an attribute named `log_std`.
+2. B1 used a scalar sum that was not aligned with the fixed group weights.
+3. B3 disabled the payload estimator together with dynamic fusion, creating a
+   confounded ablation.
+
+The corrected implementation now:
+
+- Stores action noise as `log_std` and maps old checkpoint `std` keys into it.
+- Enforces `0.05 <= std <= 0.5` after every PPO mini-batch update.
+- Logs mean/min/max std, clamp fraction, actor entropy, and actor KL.
+- Uses `0.7 task + 0.2 stability + 0.1 energy` for B1's scalar reward.
+- Keeps payload estimation and supervision in B3 while disabling only dynamic
+  fusion and falling back to fixed `[0.7, 0.2, 0.1]` advantage weights.
+
+The V2 pretrained checkpoint remains compatible: strict loading reports no
+missing, unexpected, or mismatched parameters after the `std -> log_std`
+conversion.
+
+The superseded 8000-update B0/B1 curves and intermediate B2/B4 results remain in
+the failure-analysis sections below.
+
+## Bounded Rerun: Final B0 vs B1
+
+| Metric | B0 multi-critic | B1 single critic | Better |
+|---|---:|---:|---|
+| Mean episode length | 936.0 | 933.5 | B0, marginal |
+| Hard-fall termination | 12.0% | 11.8% | Tie |
+| Base-contact termination | 6.4% | 5.3% | B1, marginal |
+| Timeout | 88.0% | 88.2% | Tie |
+| Terrain level | 3.256 | 3.297 | B1, marginal |
+| Linear tracking | 0.815 | 0.817 | Tie |
+| Angular tracking | 0.409 | 0.415 | Tie |
+| Arm position error | 0.0747 m | 0.0746 m | Tie |
+| Arm orientation error | 0.3493 rad | 0.3519 rad | B0, marginal |
+| Settle events/s | 0.0837 | 0.0682 | B0 |
+| Curriculum success | 35.7% | 30.9% | B0 |
+| Curriculum stability success | 56.7% | 53.4% | B0 |
+| Task reward | 1.224 | 1.232 | Tie |
+| Stability reward | -0.366 | -0.594 | B0 |
+| Energy reward | -0.622 | -1.460 | B0 |
+| Expert-gate entropy | 0.796 | 0.785 | Tie |
+| Mean action std | 0.381 | 0.377 | Tie |
+| Actor KL, last-100 mean | 0.015 | 11.50 | B0 |
+
+The completed methods are close on locomotion and terrain, with a trade-off:
+
+- B0 has higher curriculum success/stability, more settle events, and much
+  lower stability/energy penalties.
+- B1 is only marginally better on terrain and velocity tracking; arm errors are
+  effectively tied.
+- The scalar `Train/mean_reward` values (`8.98` for B0 and `14.44` for B1) are
+  not directly comparable because B0 fuses normalized critic advantages while
+  B1 optimizes a fixed weighted raw group sum.
+
+Both bounded policies finish with action standard deviation near `0.38` and no
+active clipping, so the variance divergence is fixed. B1's late Actor KL is
+nevertheless very large (`11.5` over the last 100 points), while B0 remains near
+`0.015`; B1's apparent performance advantage therefore needs deterministic
+evaluation and KL-stability review.
+
+## Deterministic Waypoint Evaluation
+
+Protocol:
+
+- Final `model_8000.pt` for every mode.
+- 64 environments, 1200 policy steps, seed `20261118`.
+- Random base waypoints in each terrain platform and random IK arm targets.
+- Domain randomization, observation noise, pushes, and delayed actions disabled.
+- Flat uses terrain column 0. Rough uses columns
+  `2,4,6,7,8,10,12,14,16,18,19` at row 3, covering rough flat, down-slope,
+  rough up/down slopes, stairs up/down, and discrete obstacles. The smooth
+  up-slope column and terrain rows other than row 3 were not included in this
+  first evaluation.
+- Mechanical energy is positive joint work; energy efficiency is Joules per
+  travelled metre.
+
+| Method | Flat speed RMSE | Flat energy J/m | Flat fall | Rough speed RMSE | Rough energy J/m | Rough fall | Rough arm pos | Rough targets/env |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| B0 | 0.274 | **71.00** | **1.19%** | 0.334 | 95.26 | 17.39% | 0.159 m | 2.17 |
+| B1 | 0.279 | 79.29 | 3.57% | 0.331 | 96.22 | 20.00% | **0.150 m** | 2.05 |
+| B2 | **0.235** | 81.07 | 1.20% | **0.320** | 101.81 | 5.81% | 0.182 m | **2.16** |
+| B3 | 0.282 | 74.98 | **0.00%** | 0.333 | 97.06 | 11.24% | 0.170 m | 1.91 |
+| B4 | 0.296 | 71.16 | 2.35% | 0.340 | **91.86** | 14.44% | 0.169 m | 1.89 |
+| B0F | 0.278 | 79.16 | 2.38% | 0.322 | 92.13 | **3.53%** | 0.155 m | 2.05 |
+
+Conclusions from this evaluation:
+
+- On flat terrain, B0 is the best overall compromise: lowest mechanical energy,
+  lowest fall rate tied with B2, and competitive velocity/arm errors.
+- On rough terrain, B0F is the safest and most balanced policy: lowest fall
+  rate, second-lowest energy, and low arm-position error.
+- B2 has the best flat velocity tracking and strong rough velocity tracking,
+  but its rough energy efficiency and arm accuracy are the worst.
+- B4 has slightly lower rough energy than B0F, but much higher fall rate and a
+  lower base height, so its apparent energy advantage is partly caused by a
+  lower/less mobile gait.
+- Full B0 is not robust on rough terrain: its fall rate is `17.39%`, far worse
+  than B0F's `3.53%`. This supports retaining pretrained initialization.
+
+Machine-readable results:
+`legged_gym/logs/chapter4_evaluation/results.json` and
+`legged_gym/logs/chapter4_evaluation/results.md`.
+
+## New Baseline 111: Pose Audit and Training Configuration
+
+The next training baseline is:
+
+`legged_gym/logs/111/model_14999.pt`
+
+Checkpoint properties:
+
+- `iter=14999`
+- Terrain-MoE TCN-Gate normalized architecture
+- actor, critic, gate, adapters, online experts, and velocity estimator present
+- legacy `std` key successfully converted to bounded `log_std`
+- strict load: no missing, unexpected, or mismatched parameters
+- no stored observation-normalization state
+
+Pose audit under the same random-waypoint protocol:
+
+| Terrain | Base height | Base below 0.25 m | Front stance width | Rear stance width | Left wheelbase | Right wheelbase | Fall rate |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Flat | 0.206 m | 92.9% | 0.182 m | 0.187 m | 0.379 m | 0.356 m | 44.4% |
+| Rough | 0.061 m | 87.0% | 0.190 m | 0.194 m | 0.384 m | 0.357 m | 81.2% |
+
+The base-height problem is clear: baseline 111 is far below the configured
+`0.32 m` target, including on flat terrain. The rough-terrain result is even
+worse because most episodes have already fallen.
+
+The stance widths are not narrower than the completed B0 policy: final B0 had
+front/rear widths of `0.171/0.148 m`, whereas baseline 111 has
+`0.182/0.187 m`. Therefore the audit does not support the claim that 111 has an
+unusually narrow stance relative to the existing policies, although a separate
+nominal URDF stance benchmark should be added if a hard engineering threshold
+is required.
+
+Training configuration changes:
+
+- All pretrained modes now load baseline 111 by default.
+- `CHAPTER4_BASE_CHECKPOINT` can override the checkpoint path.
+- `empirical_normalization=True`; the observation normalizer starts from
+  identity because checkpoint 111 contains no normalization statistics, then
+  learns online and is saved in subsequent checkpoints.
+
+The Chapter 4 pipeline with the new checkpoint and normalization path passes.
+
+### Fixed-arm base-only audit
+
+> **Superseded:** this run was performed after empirical normalization was
+> enabled globally but before the evaluator froze the normalizer. Because
+> checkpoint 111 contains no normalization statistics, the normalizer updated
+> during evaluation and changed the policy input distribution. The numbers in
+> this subsection are invalid and are not used for conclusions.
+
+The arm was held at its default PD target while only the Go2 base was driven by
+random waypoints. The physical arm and its mass remained attached.
+
+| Terrain | Mean base height | Healthy base height | Healthy steps | Fall | Front width | Rear width | Min foot distance |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Flat | 0.217 m | 0.287 m | 43.8% | 99.4% | 0.308 m | 0.294 m | 0.196 m |
+| Rough | 0.082 m | 0.294 m | 44.6% | 99.5% | 0.299 m | 0.294 m | 0.194 m |
+
+Conclusions:
+
+- Foot spacing is not too narrow. In healthy upright steps the front/rear
+  stance widths are approximately `0.30 m`, with a minimum inter-foot distance
+  near `0.20 m`.
+- Base height is moderately low even when upright (`0.287-0.294 m` versus the
+  `0.32 m` target), but the raw means (`0.082-0.217 m`) are dominated by falls.
+- The dominant problem is that baseline 111 is not stable when the arm is
+  frozen: fall rate is about `99.5%` on both flat and rough terrain.
+- This conflicts with the existing 1000-update fixed-arm warmup. If baseline
+  111 must be used, the fixed-arm warmup should be shortened, removed, or the
+  baseline should first be adapted to a static arm before full Chapter 4
+  training.
+
+### Full B0 pose audit
+
+Checkpoint:
+`chapter4_ablation_formal_bounded/.../B0_v2_s0/model_8000.pt`.
+
+Observation normalization was disabled for this evaluation because the
+checkpoint predates empirical normalization and has no stored statistics.
+Metrics below use healthy upright steps for stance geometry.
+
+| Terrain | Mean base height | Healthy base height | Healthy steps | Base below 0.25 m | Fall | Front width | Rear width | Left wheelbase | Right wheelbase | Min foot distance |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Flat | 0.308 m | 0.308 m | 98.9% | 0.07% | 1.2% | 0.169 m | 0.147 m | 0.335 m | 0.294 m | 0.123 m |
+| Rough | 0.171 m | 0.314 m | 98.1% | 1.72% | 17.2% | 0.182 m | 0.160 m | 0.334 m | 0.304 m | 0.130 m |
+
+Conclusions:
+
+- Base height is **not low while the policy remains upright**:
+  `0.308 m` flat and `0.314 m` rough, close to the `0.32 m` target.
+- The low rough-terrain mean base height is caused mainly by the `17.2%` fall
+  rate, not by a systematically collapsed standing posture.
+- Foot spacing is narrow relative to baseline 111. The final B0 front/rear
+  stance widths are only `0.169/0.147 m` flat and `0.182/0.160 m` rough.
+- The minimum distance between any two feet is only `0.123-0.130 m`, indicating
+  a compact support polygon and increased fall risk under arm load.
+
+Raw audit files:
+`legged_gym/logs/chapter4_evaluation_full_pose/B0_flat.json` and
+`legged_gym/logs/chapter4_evaluation_full_pose/B0_rough.json`.
+
+### Full training with baseline 111 and foot-spacing reward
+
+The `_get_base_heights()` audit confirms that the reported height is the Go2
+base height:
+
+```text
+root_states[:, 2] - terrain_height_under_base_footprint
+```
+
+`root_states` belongs to the root/base rigid body. The ARX5 end-effector,
+arm links, and arm base mount are not part of this calculation.
+
+New stability reward:
+
+- `stab__foot_spacing = -2.0`
+- target front/rear lateral stance width: `0.24 m`
+- target minimum distance between any two feet: `0.18 m`
+- positive normalized squared shortfalls are multiplied by the negative scale,
+  so narrow stances receive a penalty
+
+The first implementation accidentally returned a negative shortfall and was
+stopped after two updates. The corrected run starts in:
+
+`legged_gym/logs/chapter4_full_111_foot_spacing_v2`
+
+Training configuration for this full run:
+
+- baseline: `legged_gym/logs/111/model_14999.pt`
+- empirical observation normalization: enabled
+- mode: B0 full method
+- updates: 8000
+- corrected foot-spacing reward is present in logs as
+  `Episode/rew_stab__foot_spacing`
+
+### Reward and environment audit
+
+Checks that pass:
+
+- Every non-zero configured reward scale resolves to an existing reward
+  function.
+- Task, stability, energy, base-contact, termination, and foot-spacing terms are
+  assigned to the intended critic groups.
+- Timeout is excluded from the hard-fall termination reward.
+- `_get_base_heights()` uses the Go2 root/base rigid-body height, not the arm.
+- Foot-spacing reward sign is now correct: positive shortfall times negative
+  scale gives a penalty.
+- At a synthetic stance with `0.24 m` lateral width and at least `0.18 m`
+  inter-foot distance, the foot-spacing penalty is exactly zero.
+
+Remaining issues or caveats:
+
+1. `_reward_arm_action_rate()` and `_reward_arm_smoothness()` currently operate
+   on `self.actions`, which contains the 12-D Go2 actions, not arm targets.
+   These terms are not enabled in the current reward scales, but they should not
+   be activated without correction.
+2. `_reward_joint_power()` penalizes squared signed mechanical power. This is a
+   smoothing/shaping cost, not literal energy consumption in Joules. This is
+   consistent with the original design but should be named accordingly in paper
+   descriptions.
+3. Foot-spacing is evaluated every control step, including swing. It therefore
+   shapes both support width and swing-foot separation rather than only the
+   support polygon.
+
+## Superseded Formal Snapshot
 
 | Metric | B0 final | B1 final | B4 at ~4860 | B2 at ~5860 |
 |---|---:|---:|---:|---:|
@@ -68,6 +342,54 @@ near 0.18/0.14. This is not a successful full-method result.
 B4 is still an intermediate from-scratch run and already shows poor terrain and
 expert routing. B2 remains weak in arm tracking without the trajectory
 curriculum. These runs are not yet final.
+
+### Curve-phase diagnosis
+
+The formal curves separate into three regimes.
+
+**0-1000: fixed-arm warmup.** B0 and B1 both keep long episodes and positive
+task signal while the arm remains at its default pose. This validates the
+warmup itself.
+
+**1000-3000: post-warmup instability.** B1 incurs a short transition cost and
+then recovers. B0 instead degrades continuously:
+
+| Iteration | B0 mean reward | B0 action std | B0 terrain | B1 mean reward | B1 action std | B1 terrain |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1000 | -87.5 | 1.45 | 0.00 | 5.21 | 0.55 | 0.00 |
+| 1500 | -255.5 | 2.50 | 1.30 | 1.88 | 0.58 | 1.28 |
+| 2000 | -463.3 | 3.78 | 2.12 | 0.37 | 0.61 | 2.35 |
+| 2500 | -694.5 | 5.38 | 1.03 | 2.18 | 0.59 | 2.41 |
+| 3000 | -683.2 | 6.38 | 0.00 | 4.26 | 0.54 | 2.45 |
+
+**3000-8000: numerical recovery without task recovery.** B0's loss and mean
+reward stop diverging, but the action standard deviation continues to rise to
+`10.99`, expert entropy repeatedly collapses, terrain returns to zero, and
+linear/angular tracking finish near `0.18/0.14`. The final policy has long
+episodes mainly because it times out at a degenerate low-speed/low-height
+behavior rather than because it locomotes successfully.
+
+The same variance pathology appears in the intermediate multi-critic runs:
+
+- B2 reaches action std `8.67` by iteration 5977.
+- B4 reaches action std `10.84` by iteration 4959.
+- B1 remains near `0.26`, with expert entropy near `0.77` and terrain level
+  `2.80`.
+
+This pattern points to a shared multi-critic optimization problem rather than
+only a B0 load-weight problem. `TerrainMoeActorCritic` stores action noise in
+`std`, while the optimizer currently attempts to clamp only an attribute named
+`log_std`; the `std` parameter therefore has no effective upper bound.
+Post-warmup distribution shift then provides the perturbation that lets the
+unbounded multi-critic policy variance diverge.
+
+The immediate engineering priority is:
+
+1. Clamp the actual `actor_critic.std` parameter after every optimizer step.
+2. Log the clamp fraction and actor entropy.
+3. Smooth or stage the transition out of fixed-arm warmup.
+4. Treat current multi-critic B0/B2/B4 curves as diagnostics rather than final
+   paper results.
 
 ## Shared Load-Prior Calibration
 

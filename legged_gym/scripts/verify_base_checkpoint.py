@@ -57,8 +57,8 @@ def parse_args():
         default=(
             REPO_ROOT
             / "legged_gym"
-            / "base_policies"
-            / "go2_terrain_moe_tcn_gate_v2"
+            / "logs"
+            / "111"
             / "model_14999.pt"
         ),
     )
@@ -108,12 +108,18 @@ def main():
         **model_kwargs,
     )
     destination = model.state_dict()
-    missing = sorted(set(destination) - set(state_dict))
-    unexpected = sorted(set(state_dict) - set(destination))
+    compatible_state = dict(state_dict)
+    if "std" in compatible_state and "log_std" in destination:
+        compatible_state["log_std"] = compatible_state.pop("std").clamp(
+            min=model.noise_std_min,
+            max=model.noise_std_max,
+        ).log()
+    missing = sorted(set(destination) - set(compatible_state))
+    unexpected = sorted(set(compatible_state) - set(destination))
     mismatched = sorted(
         key
-        for key in set(destination) & set(state_dict)
-        if destination[key].shape != state_dict[key].shape
+        for key in set(destination) & set(compatible_state)
+        if destination[key].shape != compatible_state[key].shape
     )
     load_result = model.load_state_dict(state_dict, strict=True)
     model.eval()
@@ -130,6 +136,11 @@ def main():
     print(f"missing_keys: {missing}")
     print(f"unexpected_keys: {unexpected}")
     print(f"shape_mismatches: {mismatched}")
+    print(
+        "action_noise_mapping: "
+        f"std -> log_std (bounds "
+        f"[{model.noise_std_min}, {model.noise_std_max}])"
+    )
     print(f"strict_load: {load_result}")
     print(f"normalization_state: {'obs_norm_state_dict' in checkpoint}")
     print(f"action_shape: {tuple(actions.shape)}")

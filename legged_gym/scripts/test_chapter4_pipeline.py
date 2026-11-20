@@ -24,7 +24,34 @@ def main():
     assert env.num_actions == env.num_dog_actions == 12
     assert env.num_obs == 900
     assert env.num_privileged_obs == 251
-    assert runner.alg.value_dim == 3
+    assert runner.alg.value_dim == env.value_dim
+    assert set(env.reward_group_idx) == {0, 1, 2}
+    assert torch.allclose(
+        env.reward_group_weights,
+        torch.tensor([0.7, 0.2, 0.1], device=env.device),
+    )
+    assert len(env.foot_names) == 4
+    saved_feet_pos = env.feet_pos.clone()
+    env.feet_pos.zero_()
+    assert torch.isfinite(env._reward_foot_spacing()).all()
+    assert (env._reward_foot_spacing() > 0).all()
+    target_positions = {
+        "FL": (0.30, 0.12),
+        "FR": (0.30, -0.12),
+        "RL": (-0.30, 0.12),
+        "RR": (-0.30, -0.12),
+    }
+    for foot_index, foot_name in enumerate(env.foot_names):
+        side = foot_name.split("_", 1)[0]
+        env.feet_pos[:, foot_index, 0] = target_positions[side][0]
+        env.feet_pos[:, foot_index, 1] = target_positions[side][1]
+        env.feet_pos[:, foot_index, 2] = 0.0
+    assert torch.allclose(
+        env._reward_foot_spacing(),
+        torch.zeros(env.num_envs, device=env.device),
+        atol=1e-6,
+    )
+    env.feet_pos.copy_(saved_feet_pos)
     assert env.arm_fixed_warmup_iters == 1000
     env.ppo_it = env.arm_fixed_warmup_iters - 1
     assert env._arm_warmup_active()
@@ -133,12 +160,13 @@ def main():
     stats = runner.alg.last_update_stats
     assert all(
         torch.isfinite(torch.tensor(stats[f"critic_value_loss_{index}"]))
-        for index in range(3)
+        for index in range(env.value_dim)
     )
-    assert all(
-        torch.isfinite(torch.tensor(stats[f"actual_{name}_weight"]))
-        for name in ("task", "stability", "energy")
-    )
+    if env.value_dim > 1:
+        assert all(
+            torch.isfinite(torch.tensor(stats[f"actual_{name}_weight"]))
+            for name in ("task", "stability", "energy")
+        )
     assert runner.alg.actor_critic.actor[0].weight.grad is not None
     assert runner.alg.actor_critic.control_gate[0].weight.grad is not None
     assert (

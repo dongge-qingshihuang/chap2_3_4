@@ -70,7 +70,7 @@ _ABLATION_CONFIGS = {
     "B2": dict(multi_critic=True, payload_aware=True, load_aware=True,
                weight_supervision=1.0, weight_smooth=0.01,
                trajectory_curriculum=False, pretrained=True),
-    "B3": dict(multi_critic=True, payload_aware=False, load_aware=False,
+    "B3": dict(multi_critic=True, payload_aware=True, load_aware=False,
                weight_supervision=0.0, weight_smooth=0.0,
                trajectory_curriculum=True, pretrained=True),
     "B4": dict(multi_critic=True, payload_aware=True, load_aware=True,
@@ -126,6 +126,7 @@ MULTI_CRITIC = _ABLATION["multi_critic"]
 
 _VALUE_DIM = 3 if MULTI_CRITIC else 1
 REWARD_GROUPS = ("task", "stab", "energy")
+SINGLE_CRITIC_GROUP_WEIGHTS = (0.7, 0.2, 0.1)
 
 LOAD_AWARE_ENABLED = _ABLATION["load_aware"]
 LOAD_WEIGHT_HIDDEN_DIM = 64
@@ -146,11 +147,15 @@ TERMINATION_PENALTY_SCALE = -500.0
 BASE_CONTACT_PENALTY_SCALE = -5.0
 _POLICY_CLASS_NAME = "TerrainMoeActorCritic"
 _USE_PRETRAINED_INIT = _ABLATION.get("pretrained", True)
+_BASE_CHECKPOINT_OVERRIDE = os.environ.get(
+    "CHAPTER4_BASE_CHECKPOINT", ""
+)
 PRETRAINED_BASE_CHECKPOINT = (
-    os.path.join(
+    _BASE_CHECKPOINT_OVERRIDE
+    or os.path.join(
         LEGGED_GYM_ROOT_DIR,
-        "base_policies",
-        "go2_terrain_moe_tcn_gate_v2",
+        "logs",
+        "111",
         "model_14999.pt",
     )
     if _USE_PRETRAINED_INIT
@@ -474,6 +479,7 @@ class Go2ArmRoughCfg( LeggedRobotCfg ):
         ee_name = "zarx_body6"
   
     class rewards( LeggedRobotCfg.rewards ):
+        single_critic_group_weights = SINGLE_CRITIC_GROUP_WEIGHTS
         class scales:
         
 
@@ -487,6 +493,7 @@ class Go2ArmRoughCfg( LeggedRobotCfg ):
             stab__orientation = -0.2
             stab__base_height = -1.0
             stab__feet_slip = -0.01
+            stab__foot_spacing = -2.0
 
             energy__joint_power = -2e-5
             energy__dof_acc = -2.5e-7
@@ -503,6 +510,8 @@ class Go2ArmRoughCfg( LeggedRobotCfg ):
         soft_dof_vel_limit = 1.
         soft_torque_limit = 1.
         base_height_target = 0.32
+        foot_spacing_target_width = 0.24
+        foot_spacing_target_min_distance = 0.18
         max_contact_force = 100. # forces above this value are penalized
         clearance_height_target = -0.20
         manip_weight_lpy = 1.0
@@ -549,6 +558,8 @@ class Go2ArmRoughCfgPPO( LeggedRobotCfgPPO ):
         terrain_dim = 187
         activation = "elu"
         init_noise_std = 0.8
+        min_noise_std = 0.05
+        max_noise_std = 0.5
         ema_tau = 0.01
         gate_rho = 0.3
         gate_type = "temporal_tcn"
@@ -575,9 +586,7 @@ class Go2ArmRoughCfgPPO( LeggedRobotCfgPPO ):
         load_weight_min = LOAD_WEIGHT_MIN
         load_weight_max = LOAD_WEIGHT_MAX
     class runner( LeggedRobotCfgPPO.runner ):
-        # The pretrained Terrain-MoE actor was trained without empirical
-        # normalization; keep the initialization input scale identical.
-        empirical_normalization = False
+        empirical_normalization = True
         policy_class_name = _POLICY_CLASS_NAME
         algorithm_class_name = 'HIMPPO'
         num_steps_per_env = 24 # per iteration
@@ -627,6 +636,8 @@ class Go2ArmRoughCfgPPO( LeggedRobotCfgPPO ):
             terrain_dim = 187
             activation = "elu"
             init_noise_std = 0.8
+            min_noise_std = 0.05
+            max_noise_std = 0.5
             ema_tau = 0.01
             gate_rho = 0.3
             gate_type = "temporal_tcn"
