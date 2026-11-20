@@ -317,10 +317,30 @@ def main():
                 runner.alg.actor_critic.base_action_residual.parameters()
             )
         )
-    assert all(
-        parameter.grad is None
-        for parameter in runner.alg.actor_critic.TsDyn_modules.parameters()
+    full_expert_finetune = (
+        runner.alg.actor_critic.finetune_mode == "full"
+        and not runner.alg.actor_critic.expert_freeze
     )
+    if full_expert_finetune:
+        assert any(
+            parameter.grad is not None
+            for parameter in (
+                runner.alg.actor_critic.TsDyn_modules.parameters()
+            )
+        )
+        assert all(
+            parameter.grad is None
+            for parameter in (
+                runner.alg.actor_critic.target_TsDyn_modules.parameters()
+            )
+        )
+    else:
+        assert all(
+            parameter.grad is None
+            for parameter in (
+                runner.alg.actor_critic.TsDyn_modules.parameters()
+            )
+        )
 
     curriculum_state = env.get_curriculum_state()
     assert curriculum_state is not None

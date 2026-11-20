@@ -89,6 +89,7 @@ _ABLATION_CONFIGS = {
                  trajectory_curriculum=True, pretrained=True,
                  base_action_residual=True,
                  freeze_pretrained_actor=False,
+                 finetune_mode="full", expert_freeze=False,
                  moving_arm_completion_reward=True),
     "B4": dict(multi_critic=True, payload_aware=True, load_aware=True,
                weight_supervision=1.0, weight_smooth=0.01,

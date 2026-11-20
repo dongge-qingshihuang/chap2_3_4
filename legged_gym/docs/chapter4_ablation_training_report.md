@@ -410,17 +410,16 @@ The first version uses B3's non-dynamic critic configuration with fixed
 `[0.7, 0.2, 0.1]` task/stability/energy advantage weights. `B3R` keeps the
 pretrained Chap3 actor, control adapters, gate, temporal encoder, and action
 standard deviation frozen. `B3RM` instead fine-tunes the pretrained actor,
-control adapters, gate, and action standard deviation jointly with the residual.
-The online experts and velocity estimator remain frozen in partial fine-tuning
-mode; the payload estimator continues to train through its dedicated
-supervision loss.
+control adapters, gate, action standard deviation, online experts, and velocity
+estimator jointly with the residual. The EMA target experts remain frozen. The
+payload estimator continues to train through its dedicated supervision loss.
 
 The four controlled groups are:
 
 - `B3`: original fixed-weight reference;
 - `B3R`: B3 plus the arm-conditioned residual;
 - `B3M`: B3 plus the moving-arm completion reward;
-- `B3RM`: B3 plus both modules and a jointly trainable pretrained base actor.
+- `B3RM`: B3 plus both modules and full pretrained-base fine-tuning.
 
 Smoke checks pass for zero-output initialization, bounded residual output,
 residual-only gradients, storage round-trip, checkpoint initialization, joint
