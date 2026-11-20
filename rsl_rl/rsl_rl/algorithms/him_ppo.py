@@ -223,9 +223,11 @@ class HIMPPO:
         self.train_base = True
 
     def init_storage(self, num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, action_shape,
-                     base_obs_shape=None, base_actions_shape=None):
+                     base_obs_shape=None, base_actions_shape=None,
+                     residual_context_shape=None):
         self.storage = HIMRolloutStorage(num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, action_shape, self.device,
                                          base_obs_shape=base_obs_shape, base_actions_shape=base_actions_shape,
+                                         residual_context_shape=residual_context_shape,
                                          value_dim=self.value_dim)
 
     def test_mode(self):
@@ -234,13 +236,20 @@ class HIMPPO:
     def train_mode(self):
         self.actor_critic.train()
 
-    def act(self, obs, critic_obs):
+    def act(self, obs, critic_obs, residual_context=None):
         # Compute the actions and values
-        self.transition.actions = self.actor_critic.act(obs).detach()
+        self.transition.actions = self.actor_critic.act(
+            obs, residual_context=residual_context
+        ).detach()
         self.transition.values = self.actor_critic.evaluate(critic_obs).detach()
         self.transition.actions_log_prob = self.actor_critic.get_actions_log_prob(self.transition.actions).detach()
         self.transition.action_mean = self.actor_critic.action_mean.detach()
         self.transition.action_sigma = self.actor_critic.action_std.detach()
+        self.transition.residual_context = (
+            residual_context.detach().clone()
+            if residual_context is not None
+            else None
+        )
         if self.value_dim > 1:
             get_payload = getattr(
                 self.actor_critic, "get_payload_estimate", None
@@ -403,11 +412,15 @@ class HIMPPO:
             previous_load_weights_batch,
             load_weight_smooth_mask_batch,
             payload_predictions_batch,
-            base_batch
+            base_batch,
+            residual_context_batch,
         ) in generator:
 
             # 1) 用当前 policy 重新建立动作分布
-            self.actor_critic.act(obs_batch)
+            self.actor_critic.act(
+                obs_batch,
+                residual_context=residual_context_batch,
+            )
             actions_log_prob_batch = self.actor_critic.get_actions_log_prob(actions_batch)
             value_batch = self.actor_critic.evaluate(critic_obs_batch)
             mu_batch = self.actor_critic.action_mean

@@ -57,8 +57,8 @@ def parse_args():
         default=(
             REPO_ROOT
             / "legged_gym"
-            / "logs"
-            / "111"
+            / "base_policies"
+            / "go2_terrain_moe_tcn_gate_v2_obsnorm"
             / "model_14999.pt"
         ),
     )
@@ -142,7 +142,11 @@ def main():
         f"[{model.noise_std_min}, {model.noise_std_max}])"
     )
     print(f"strict_load: {load_result}")
-    print(f"normalization_state: {'obs_norm_state_dict' in checkpoint}")
+    normalization_state = (
+        checkpoint.get("obs_normalizer_state_dict")
+        or checkpoint.get("obs_norm_state_dict")
+    )
+    print(f"normalization_state: {normalization_state is not None}")
     print(f"action_shape: {tuple(actions.shape)}")
     print(f"finite: {torch.isfinite(actions).all().item()}")
 

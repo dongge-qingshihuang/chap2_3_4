@@ -21,6 +21,9 @@ def main():
     runner, _ = task_registry.make_alg_runner(
         env=env, name=args.task, args=args, log_root=None
     )
+    if runner._pretrained_obs_normalizer_state is not None:
+        assert runner.empirical_normalization
+        assert runner.obs_normalizer.count.item() > 0
     assert env.num_actions == env.num_dog_actions == 12
     assert env.num_obs == 900
     assert env.num_privileged_obs == 251
@@ -30,6 +33,123 @@ def main():
         env.reward_group_weights,
         torch.tensor([0.7, 0.2, 0.1], device=env.device),
     )
+    if env.cfg.rewards.moving_arm_completion_enabled:
+        assert abs(
+            env.reward_scales["task__moving_arm_completion"] - 0.2
+        ) < 1e-6
+        saved_state = {
+            name: getattr(env, name).clone()
+            for name in (
+                "executed_commands_snapshot",
+                "base_lin_vel",
+                "reset_buf",
+                "settle_buf",
+                "arm_settle_in_tol",
+                "moving_completion_eligible",
+                "moving_completion_awarded",
+                "moving_completion_hold_counter",
+                "moving_completion_tracking_sum",
+                "moving_completion_progress",
+                "moving_completion_required",
+                "moving_completion_pending_reward",
+                "moving_completion_event_buf",
+                "moving_completion_moving_event_buf",
+                "moving_completion_static_event_buf",
+                "moving_completion_event_progress_ratio",
+                "moving_completion_event_mean_tracking",
+                "episode_moving_completion_count",
+                "episode_static_completion_count",
+                "episode_moving_completion_bonus_sum",
+            )
+        }
+
+        def reset_window():
+            env._reset_moving_completion_window(
+                torch.arange(env.num_envs, device=env.device)
+            )
+            env.moving_completion_eligible[:] = True
+            env.executed_commands_snapshot.zero_()
+            env.base_lin_vel.zero_()
+            env.reset_buf.zero_()
+
+        def feed_window(command_speed, actual_speed):
+            env.executed_commands_snapshot[:, 0] = command_speed
+            env.base_lin_vel[:, 0] = actual_speed
+            for step in range(
+                env.cfg.rewards.moving_arm_completion_hold_steps
+            ):
+                env.arm_settle_in_tol[:] = True
+                env.settle_buf[:] = step + 1 == (
+                    env.cfg.rewards.moving_arm_completion_hold_steps
+                )
+                env._update_moving_completion_window()
+
+        reset_window()
+        feed_window(0.5, 0.5)
+        reward = env._reward_moving_arm_completion()
+        assert torch.allclose(reward, torch.ones_like(reward), atol=1e-6)
+        assert torch.equal(
+            env._reward_moving_arm_completion(),
+            torch.zeros_like(reward),
+        )
+        assert torch.allclose(
+            env.episode_moving_completion_bonus_sum,
+            torch.full_like(reward, 0.2),
+            atol=1e-6,
+        )
+
+        reset_window()
+        feed_window(0.5, -0.5)
+        assert torch.equal(
+            env._reward_moving_arm_completion(),
+            torch.zeros(env.num_envs, device=env.device),
+        )
+
+        moving_count_before_static = (
+            env.episode_moving_completion_count.clone()
+        )
+        reset_window()
+        feed_window(0.0, 0.0)
+        assert torch.equal(
+            env._reward_moving_arm_completion(),
+            torch.zeros(env.num_envs, device=env.device),
+        )
+        assert torch.all(env.episode_static_completion_count > 0)
+        assert torch.equal(
+            env.episode_moving_completion_count,
+            moving_count_before_static,
+        )
+
+        reset_window()
+        env.executed_commands_snapshot[:, 0] = 0.5
+        env.base_lin_vel[:, 0] = 0.5
+        for step in range(10):
+            env.arm_settle_in_tol[:] = True
+            env.settle_buf[:] = False
+            env._update_moving_completion_window()
+        env.arm_settle_in_tol[:] = False
+        env._update_moving_completion_window()
+        for step in range(
+            env.cfg.rewards.moving_arm_completion_hold_steps - 1
+        ):
+            env.arm_settle_in_tol[:] = True
+            env.settle_buf[:] = False
+            env._update_moving_completion_window()
+        assert torch.equal(
+            env._reward_moving_arm_completion(),
+            torch.zeros(env.num_envs, device=env.device),
+        )
+
+        reset_window()
+        env.reset_buf[:] = True
+        feed_window(0.5, 0.5)
+        assert torch.equal(
+            env._reward_moving_arm_completion(),
+            torch.zeros(env.num_envs, device=env.device),
+        )
+
+        for name, value in saved_state.items():
+            getattr(env, name).copy_(value)
     assert len(env.foot_names) == 4
     saved_feet_pos = env.feet_pos.clone()
     env.feet_pos.zero_()
@@ -127,7 +247,16 @@ def main():
 
     observations, critic_observations = env.reset()
     for step_index in range(runner.num_steps_per_env):
-        actions = runner.alg.act(observations, critic_observations)
+        residual_context = (
+            env.get_base_action_residual_obs()
+            if runner.alg.actor_critic.base_action_residual_enabled
+            else None
+        )
+        actions = runner.alg.act(
+            observations,
+            critic_observations,
+            residual_context=residual_context,
+        )
         (
             observations,
             privileged,
@@ -167,12 +296,26 @@ def main():
             torch.isfinite(torch.tensor(stats[f"actual_{name}_weight"]))
             for name in ("task", "stability", "energy")
         )
-    assert runner.alg.actor_critic.actor[0].weight.grad is not None
-    assert runner.alg.actor_critic.control_gate[0].weight.grad is not None
-    assert (
-        runner.alg.actor_critic.control_adapters[0][0].weight.grad
-        is not None
-    )
+    if runner.alg.actor_critic.base_action_residual_enabled:
+        assert runner.alg.actor_critic.actor[0].weight.grad is None
+        assert runner.alg.actor_critic.control_gate[0].weight.grad is None
+        assert (
+            runner.alg.actor_critic.control_adapters[0][0].weight.grad
+            is None
+        )
+        assert any(
+            parameter.grad is not None
+            for parameter in (
+                runner.alg.actor_critic.base_action_residual.parameters()
+            )
+        )
+    else:
+        assert runner.alg.actor_critic.actor[0].weight.grad is not None
+        assert runner.alg.actor_critic.control_gate[0].weight.grad is not None
+        assert (
+            runner.alg.actor_critic.control_adapters[0][0].weight.grad
+            is not None
+        )
     assert all(
         parameter.grad is None
         for parameter in runner.alg.actor_critic.TsDyn_modules.parameters()

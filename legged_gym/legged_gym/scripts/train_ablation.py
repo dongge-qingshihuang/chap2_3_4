@@ -39,6 +39,11 @@ def main():
         f"curriculum={env_cfg.arm.trajectory_curriculum.enabled} "
         f"payload_aware={env_cfg.arm.payload.mode != 'none'} "
         f"load_aware={train_cfg.policy.load_aware_enabled} "
+        f"base_action_residual="
+        f"{train_cfg.policy.base_action_residual_enabled} "
+        f"moving_arm_completion="
+        f"{env_cfg.rewards.moving_arm_completion_enabled} "
+        f"actor_frozen={train_cfg.runner.freeze_pretrained_actor} "
         f"pretrained={bool(train_cfg.runner.pretrained_base_checkpoint)} "
         f"run={args.experiment_name}/{args.run_name}",
         flush=True,

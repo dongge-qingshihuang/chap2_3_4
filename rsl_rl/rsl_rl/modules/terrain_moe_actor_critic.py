@@ -341,6 +341,10 @@ class TerrainMoeActorCritic(nn.Module):
         load_weight_hidden_dim=64,
         load_weight_min=0.05,
         load_weight_max=0.90,
+        base_action_residual_enabled=False,
+        base_action_residual_context_dim=18,
+        base_action_residual_hidden_dims=(128, 64),
+        base_action_residual_clip=0.1,
         **kwargs,
     ):
         super().__init__()
@@ -351,6 +355,22 @@ class TerrainMoeActorCritic(nn.Module):
         self.num_critics = int(num_critics)
         self.payload_dim = int(payload_dim)
         self.load_aware_enabled = bool(load_aware_enabled)
+        self.base_action_residual_enabled = bool(
+            base_action_residual_enabled
+        )
+        self.base_action_residual_context_dim = int(
+            base_action_residual_context_dim
+        )
+        self.base_action_residual_feature_dim = (
+            num_proprio + latent_dim + 3
+        )
+        self.base_action_residual_clip = float(
+            base_action_residual_clip
+        )
+        if self.base_action_residual_clip <= 0:
+            raise ValueError(
+                "base_action_residual_clip must be positive"
+            )
         self.finetune_mode = "partial"
         self.expert_freeze = True
         self.gate_lr_multiplier = 0.25
@@ -536,6 +556,16 @@ class TerrainMoeActorCritic(nn.Module):
             if self.payload_dim > 0
             else None
         )
+        self.base_action_residual = None
+        if self.base_action_residual_enabled:
+            self.base_action_residual = build_mlp(
+                self.base_action_residual_feature_dim
+                + self.base_action_residual_context_dim,
+                list(base_action_residual_hidden_dims),
+                num_actions,
+                activation,
+            )
+            zero_last_linear(self.base_action_residual)
         self.load_weight_net = (
             LoadAwareWeightNetwork(
                 payload_dim=self.payload_dim,
@@ -567,6 +597,8 @@ class TerrainMoeActorCritic(nn.Module):
         self.last_perception = None
         self.last_payload_prediction = None
         self.last_load_weights = None
+        self.last_base_action_mean = None
+        self.last_action_residual = None
         self.last_aux_metrics = {}
         Normal.set_default_validate_args = False
 
@@ -749,29 +781,65 @@ class TerrainMoeActorCritic(nn.Module):
             dim=-1,
         )
 
-    def _mean(self, history):
+    def _mean(self, history, residual_context=None):
         perception = self.perceive(
             history,
             use_target=self.use_ema
             and not self.train_perception_with_ppo,
         )
-        return self.actor(self._actor_input(history, perception)), perception
+        actor_input = self._actor_input(history, perception)
+        base_action_mean = self.actor(actor_input)
+        self.last_base_action_mean = base_action_mean
+        if self.base_action_residual is None:
+            self.last_action_residual = None
+            return base_action_mean, perception
+        if residual_context is None:
+            raise ValueError(
+                "Residual context is required when "
+                "base_action_residual_enabled=True"
+            )
+        if residual_context.size(-1) != self.base_action_residual_context_dim:
+            raise ValueError(
+                "Residual context dimension mismatch: "
+                f"{residual_context.size(-1)} != "
+                f"{self.base_action_residual_context_dim}"
+            )
+        residual_input = torch.cat(
+            (
+                actor_input.detach(),
+                residual_context.to(
+                    device=history.device, dtype=history.dtype
+                ),
+            ),
+            dim=-1,
+        )
+        action_residual = self.base_action_residual_clip * torch.tanh(
+            self.base_action_residual(residual_input)
+        )
+        self.last_action_residual = action_residual
+        return base_action_mean + action_residual, perception
 
-    def update_distribution(self, history):
-        mean, _ = self._mean(history)
+    def update_distribution(self, history, residual_context=None):
+        mean, _ = self._mean(
+            history, residual_context=residual_context
+        )
         self.distribution = Normal(mean, mean * 0.0 + self.std)
         return mean
 
-    def act(self, history, **kwargs):
-        self.update_distribution(history)
+    def act(self, history, residual_context=None, **kwargs):
+        self.update_distribution(
+            history, residual_context=residual_context
+        )
         return self.distribution.sample()
 
     def get_actions_log_prob(self, actions):
         return self.distribution.log_prob(actions).sum(dim=-1)
 
     @torch.no_grad()
-    def act_inference(self, history, **kwargs):
-        mean, _ = self._mean(history)
+    def act_inference(self, history, residual_context=None, **kwargs):
+        mean, _ = self._mean(
+            history, residual_context=residual_context
+        )
         return mean
 
     def evaluate(self, critic_observations, **kwargs):
@@ -902,6 +970,7 @@ class TerrainMoeActorCritic(nn.Module):
         adapter_lr_multiplier=0.25,
         actor_lr_multiplier=1.0,
         expert_lr_multiplier=0.1,
+        freeze_actor=False,
     ):
         """Apply real parameter freezing for Chapter 4 PPO fine-tuning."""
         mode = str(mode).lower()
@@ -940,6 +1009,17 @@ class TerrainMoeActorCritic(nn.Module):
                 for parameter in module.parameters():
                     parameter.requires_grad_(True)
         self.log_std.requires_grad_(True)
+        if freeze_actor:
+            for module in (
+                self.actor,
+                self.control_adapters,
+                self.control_gate,
+                self.temporal_gate_encoder,
+            ):
+                if module is not None:
+                    for parameter in module.parameters():
+                        parameter.requires_grad_(False)
+            self.log_std.requires_grad_(False)
         return self
 
     def get_payload_estimate(self):
@@ -959,18 +1039,34 @@ class TerrainMoeActorCritic(nn.Module):
         return list(self.load_weight_net.parameters())
 
     def policy_parameter_groups(self):
-        groups = [
-            {
-                "params": list(self.actor.parameters()) + [self.log_std],
-                "lr_multiplier": self.actor_lr_multiplier,
-                "name": "actor",
-            },
-            {
-                "params": list(self.control_adapters.parameters()),
-                "lr_multiplier": self.adapter_lr_multiplier,
-                "name": "control_adapters",
-            },
-        ]
+        groups = []
+        if self.base_action_residual is not None:
+            groups.append(
+                {
+                    "params": list(
+                        self.base_action_residual.parameters()
+                    ),
+                    "lr_multiplier": self.actor_lr_multiplier,
+                    "name": "base_action_residual",
+                }
+            )
+        groups.extend(
+            [
+                {
+                    "params": list(self.actor.parameters())
+                    + [self.log_std],
+                    "lr_multiplier": self.actor_lr_multiplier,
+                    "name": "actor",
+                },
+                {
+                    "params": list(
+                        self.control_adapters.parameters()
+                    ),
+                    "lr_multiplier": self.adapter_lr_multiplier,
+                    "name": "control_adapters",
+                },
+            ]
+        )
         if self.control_gate is not None:
             gate_parameters = list(self.control_gate.parameters())
             if self.temporal_gate_encoder is not None:
@@ -1046,7 +1142,7 @@ class TerrainMoeActorCritic(nn.Module):
             perception_targets.append("payload_estimator")
         if self.load_weight_net is not None:
             perception_targets.append("load_weight_net")
-        return {
+        metadata = {
             "architecture_version": self.architecture_version,
             "num_modes": self.num_modes,
             "latent_dim": self.latent_dim,
@@ -1084,3 +1180,19 @@ class TerrainMoeActorCritic(nn.Module):
                 perception_targets
             ),
         }
+        if self.base_action_residual_enabled:
+            metadata.update(
+                {
+                    "base_action_residual_enabled": True,
+                    "base_action_residual_context_dim": (
+                        self.base_action_residual_context_dim
+                    ),
+                    "base_action_residual_feature_dim": (
+                        self.base_action_residual_feature_dim
+                    ),
+                    "base_action_residual_clip": (
+                        self.base_action_residual_clip
+                    ),
+                }
+            )
+        return metadata

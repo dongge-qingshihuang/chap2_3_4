@@ -90,6 +90,10 @@ class Chapter4PolicyTest(unittest.TestCase):
 
     def test_bounded_log_std_and_legacy_std_checkpoint(self):
         model = self.build_trainable_model()
+        self.assertNotIn(
+            "base_action_residual_enabled",
+            model.architecture_metadata(),
+        )
         state = model.state_dict()
         self.assertIn("log_std", state)
         self.assertNotIn("std", state)
@@ -166,6 +170,118 @@ class Chapter4PolicyTest(unittest.TestCase):
         )
         self.assertEqual(
             tuple(model.evaluate(torch.randn(4, 251)).shape), (4, 3)
+        )
+
+    def test_arm_reference_residual_is_zero_initialized(self):
+        model = TerrainMoeActorCritic(
+            900,
+            251,
+            12,
+            45,
+            None,
+            20,
+            **pretrained_kwargs(),
+            num_critics=3,
+            payload_dim=9,
+            payload_hidden_dims=(256, 128),
+            load_aware_enabled=False,
+            base_action_residual_enabled=True,
+            base_action_residual_context_dim=18,
+            base_action_residual_hidden_dims=(32, 16),
+            base_action_residual_clip=0.1,
+        )
+        observations = torch.randn(4, 900)
+        context = torch.randn(4, 18)
+        first_residual_layer = next(
+            layer
+            for layer in model.base_action_residual.modules()
+            if isinstance(layer, torch.nn.Linear)
+        )
+        self.assertEqual(first_residual_layer.in_features, 80 + 18)
+        with torch.no_grad():
+            mean, _ = model._mean(
+                observations, residual_context=context
+            )
+        self.assertTrue(
+            torch.allclose(mean, model.last_base_action_mean, atol=1e-7)
+        )
+        self.assertTrue(
+            torch.equal(
+                model.last_action_residual,
+                torch.zeros(4, 12),
+            )
+        )
+
+        with torch.no_grad():
+            next(
+                layer
+                for layer in reversed(
+                    list(model.base_action_residual.modules())
+                )
+                if isinstance(layer, torch.nn.Linear)
+            ).bias.fill_(1.0)
+            mean, _ = model._mean(
+                observations, residual_context=context
+            )
+        residual = mean - model.last_base_action_mean
+        self.assertGreater(residual.abs().max().item(), 0.0)
+        self.assertLessEqual(
+            residual.abs().max().item(),
+            model.base_action_residual_clip + 1e-6,
+        )
+
+    def test_residual_only_training_keeps_chapter3_actor_frozen(self):
+        model = TerrainMoeActorCritic(
+            900,
+            251,
+            12,
+            45,
+            None,
+            20,
+            **pretrained_kwargs(),
+            num_critics=3,
+            payload_dim=9,
+            payload_hidden_dims=(256, 128),
+            load_aware_enabled=False,
+            base_action_residual_enabled=True,
+            base_action_residual_context_dim=18,
+            base_action_residual_hidden_dims=(32, 16),
+        )
+        model.configure_finetune("partial", freeze_actor=True)
+        self.assertTrue(
+            all(
+                not parameter.requires_grad
+                for parameter in model.actor.parameters()
+            )
+        )
+        self.assertFalse(model.log_std.requires_grad)
+        self.assertTrue(
+            all(
+                not parameter.requires_grad
+                for parameter in model.control_adapters.parameters()
+            )
+        )
+        self.assertTrue(
+            all(
+                parameter.requires_grad
+                for parameter in model.base_action_residual.parameters()
+            )
+        )
+        self.assertTrue(model.critic_heads[0].weight.requires_grad)
+        self.assertTrue(model.payload_estimator[0].weight.requires_grad)
+
+        model.zero_grad(set_to_none=True)
+        actions = model.act(
+            torch.randn(4, 900),
+            residual_context=torch.randn(4, 18),
+        )
+        model.get_actions_log_prob(actions).mean().backward()
+        self.assertIsNone(model.actor[0].weight.grad)
+        self.assertTrue(
+            any(
+                parameter.grad is not None
+                for parameter in model.base_action_residual.parameters()
+            )
         )
 
     def test_full_mode_can_unfreeze_experts_and_ema_stays_frozen(self):

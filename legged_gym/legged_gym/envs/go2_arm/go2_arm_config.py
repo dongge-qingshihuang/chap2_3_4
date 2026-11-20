@@ -73,6 +73,23 @@ _ABLATION_CONFIGS = {
     "B3": dict(multi_critic=True, payload_aware=True, load_aware=False,
                weight_supervision=0.0, weight_smooth=0.0,
                trajectory_curriculum=True, pretrained=True),
+    # B3 reference plus a zero-initialized arm-conditioned leg-action residual.
+    "B3R": dict(multi_critic=True, payload_aware=True, load_aware=False,
+                weight_supervision=0.0, weight_smooth=0.0,
+                trajectory_curriculum=True, pretrained=True,
+                base_action_residual=True, freeze_pretrained_actor=True,
+                moving_arm_completion_reward=False),
+    "B3M": dict(multi_critic=True, payload_aware=True, load_aware=False,
+                weight_supervision=0.0, weight_smooth=0.0,
+                trajectory_curriculum=True, pretrained=True,
+                base_action_residual=False, freeze_pretrained_actor=False,
+                moving_arm_completion_reward=True),
+    "B3RM": dict(multi_critic=True, payload_aware=True, load_aware=False,
+                 weight_supervision=0.0, weight_smooth=0.0,
+                 trajectory_curriculum=True, pretrained=True,
+                 base_action_residual=True,
+                 freeze_pretrained_actor=True,
+                 moving_arm_completion_reward=True),
     "B4": dict(multi_critic=True, payload_aware=True, load_aware=True,
                weight_supervision=1.0, weight_smooth=0.01,
                trajectory_curriculum=True, pretrained=False,
@@ -154,8 +171,8 @@ PRETRAINED_BASE_CHECKPOINT = (
     _BASE_CHECKPOINT_OVERRIDE
     or os.path.join(
         LEGGED_GYM_ROOT_DIR,
-        "logs",
-        "111",
+        "base_policies",
+        "go2_terrain_moe_tcn_gate_v2_obsnorm",
         "model_14999.pt",
     )
     if _USE_PRETRAINED_INIT
@@ -177,6 +194,21 @@ ARM_COMMAND_SOURCE = (
 )
 LOAD_AWARE_ADVANTAGE = LOAD_AWARE_ENABLED
 MULTI_CRITIC_ENABLED = MULTI_CRITIC
+BASE_ACTION_RESIDUAL_ENABLED = bool(
+    _ABLATION.get("base_action_residual", False)
+)
+BASE_ACTION_RESIDUAL_CONTEXT_DIM = 18
+FREEZE_PRETRAINED_ACTOR = bool(
+    _ABLATION.get("freeze_pretrained_actor", False)
+)
+MOVING_ARM_COMPLETION_ENABLED = bool(
+    _ABLATION.get("moving_arm_completion_reward", False)
+)
+MOVING_ARM_COMPLETION_BONUS = 0.2
+MOVING_ARM_COMPLETION_MIN_COMMAND_SPEED = 0.05
+MOVING_ARM_COMPLETION_SCALE = MOVING_ARM_COMPLETION_BONUS / (
+    LeggedRobotCfg.sim.dt * LeggedRobotCfg.control.decimation
+)
 
 
 class Go2ArmRoughCfg( LeggedRobotCfg ):
@@ -460,9 +492,11 @@ class Go2ArmRoughCfg( LeggedRobotCfg ):
             max_curriculum = 1.5
             num_commands = 4 # default: lin_vel_x, lin_vel_y, ang_vel_yaw, heading (in heading mode ang_vel_yaw is recomputed from heading error)
             resampling_time = 10. # time before command are changed[s]
-            heading_command = True # if true: compute ang vel command from heading error
+            # The obsnorm LiftSpacing checkpoint was trained with heading
+            # control enabled.
+            heading_command = True
             class ranges( LeggedRobotCfg.commands.ranges):
-                lin_vel_x = [-1.0, 1.5] # min max [m/s]
+                lin_vel_x = [-1.0, 1.0] # min max [m/s]
                 lin_vel_y = [-1.0, 1.0]   # min max [m/s]
                 ang_vel_yaw = [-3.14, 3.14]    # min max [rad/s]
                 heading = [-3.14, 3.14]
@@ -487,6 +521,11 @@ class Go2ArmRoughCfg( LeggedRobotCfg ):
 
             task__tracking_lin_vel = 1.0
             task__tracking_ang_vel = 0.5
+            task__moving_arm_completion = (
+                MOVING_ARM_COMPLETION_SCALE
+                if MOVING_ARM_COMPLETION_ENABLED
+                else 0.0
+            )
 
             stab__lin_vel_z = -2.0
             stab__ang_vel_xy = -0.05
@@ -512,6 +551,11 @@ class Go2ArmRoughCfg( LeggedRobotCfg ):
         base_height_target = 0.32
         foot_spacing_target_width = 0.24
         foot_spacing_target_min_distance = 0.18
+        moving_arm_completion_hold_steps = 15
+        moving_arm_completion_min_command_speed = (
+            MOVING_ARM_COMPLETION_MIN_COMMAND_SPEED
+        )
+        moving_arm_completion_enabled = MOVING_ARM_COMPLETION_ENABLED
         max_contact_force = 100. # forces above this value are penalized
         clearance_height_target = -0.20
         manip_weight_lpy = 1.0
@@ -585,6 +629,14 @@ class Go2ArmRoughCfgPPO( LeggedRobotCfgPPO ):
         load_weight_hidden_dim = LOAD_WEIGHT_HIDDEN_DIM
         load_weight_min = LOAD_WEIGHT_MIN
         load_weight_max = LOAD_WEIGHT_MAX
+        # Zero-initialized arm-conditioned leg-action residual. The branch
+        # sees the B3 actor feature plus 18-D arm state/reference context.
+        base_action_residual_enabled = BASE_ACTION_RESIDUAL_ENABLED
+        base_action_residual_context_dim = (
+            BASE_ACTION_RESIDUAL_CONTEXT_DIM
+        )
+        base_action_residual_hidden_dims = (128, 64)
+        base_action_residual_clip = 0.1
     class runner( LeggedRobotCfgPPO.runner ):
         empirical_normalization = True
         policy_class_name = _POLICY_CLASS_NAME
@@ -610,6 +662,7 @@ class Go2ArmRoughCfgPPO( LeggedRobotCfgPPO ):
         arm_trajectory_curriculum = ARM_TRAJECTORY_CURRICULUM
         load_aware_advantage = LOAD_AWARE_ADVANTAGE
         multi_critic = MULTI_CRITIC_ENABLED
+        freeze_pretrained_actor = FREEZE_PRETRAINED_ACTOR
         base_policy_class_name = "TerrainMoeActorCritic"
         base_policy_path = PRETRAINED_BASE_CHECKPOINT
         base_policy_architecture_version = (

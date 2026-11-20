@@ -890,9 +890,11 @@ class Go2ArmEnv(BaseTask):
     def _resample_arm_commands(self, env_ids, use_traj=True):
         if len(env_ids) == 0:
             return
+        self._reset_moving_completion_window(env_ids)
         if not self._arm_motion_enabled():
             self._set_default_arm_command(env_ids)
             return
+        self.moving_completion_eligible[env_ids] = True
 
         curriculum = getattr(self, "arm_trajectory_curriculum", None)
         if curriculum is not None and curriculum.enabled:
@@ -1038,6 +1040,33 @@ class Go2ArmEnv(BaseTask):
     def get_dog_one_step_obs(self):
         return self._dog_obs_block()
 
+    def get_base_action_residual_obs(self):
+        """Side-channel input for the zero-initialized leg-action residual.
+
+        Shape is 18: current 6-D arm joint position error, current 6-D arm
+        joint velocity, and the next 6-D IK-reference joint velocity. The B3
+        actor feature is appended inside ``TerrainMoeActorCritic``.
+        """
+        arm_q_error = (
+            self.dof_pos[:, self.arm_control_dof_slice]
+            - self.default_dof_pos[:, self.arm_control_dof_slice]
+        ) * self.obs_scales.dof_pos
+        arm_q_vel = (
+            self.dof_vel[:, self.arm_control_dof_slice]
+            * self.obs_scales.dof_vel
+        )
+        arm_reference_vel = (
+            self.arm_target_vel * self.obs_scales.dof_vel
+        )
+        return torch.clamp(
+            torch.cat(
+                (arm_q_error, arm_q_vel, arm_reference_vel),
+                dim=-1,
+            ),
+            -5.0,
+            5.0,
+        )
+
     def _privileged_current_obs(self, current_obs):
         """特权观测：本体观测 + 基座真实线速度 + 外扰 + 高度图 (+ 第二章负载真值)。
         负载真值仅在训练期存在，用作黑盒估计器的监督目标。"""
@@ -1160,6 +1189,9 @@ class Go2ArmEnv(BaseTask):
         Args:
             actions (torch.Tensor): Tensor of shape (num_envs, num_actions_per_env)
         """
+        # Pair this physics interval's measured velocity with the command that
+        # was actually active for it, before post-step command resampling.
+        self.executed_commands_snapshot.copy_(self.commands)
         clip_actions = self.cfg.normalization.clip_actions
         self.actions = torch.clip(actions, -clip_actions, clip_actions).to(self.device)
         if self.actions.shape[-1] != self.num_dog_actions:
@@ -1235,6 +1267,7 @@ class Go2ArmEnv(BaseTask):
 
         # compute observations, rewards, resets, ...
         self.check_termination()
+        self._update_moving_completion_window()
         self.compute_reward()
         env_ids = self.reset_buf.nonzero(as_tuple=False).flatten()
         termination_privileged_obs = self.compute_termination_observations(env_ids)
@@ -1377,6 +1410,7 @@ class Go2ArmEnv(BaseTask):
     def _set_default_arm_command(self, env_ids):
         if len(env_ids) == 0:
             return
+        self._reset_moving_completion_window(env_ids)
         q6 = self.default_dof_pos[
             :, self.arm_control_dof_slice
         ].expand(len(env_ids), -1)
@@ -1514,6 +1548,23 @@ class Go2ArmEnv(BaseTask):
         self.extras["episode"]["arm_pos_err_mean"] = torch.mean(self.episode_pos_err_sum[env_ids] / ep_len)
         self.extras["episode"]["arm_ori_err_mean"] = torch.mean(self.episode_ori_err_sum[env_ids] / ep_len)
         self.extras["episode"]["arm_settle_per_s"] = torch.mean(self.episode_settle_count[env_ids] / (ep_len * self.dt))
+        completion_count = self.episode_moving_completion_count[env_ids]
+        static_completion_count = self.episode_static_completion_count[env_ids]
+        completion_bonus_sum = (
+            self.episode_moving_completion_bonus_sum[env_ids]
+        )
+        self.extras["episode"]["moving_arm_completion_events"] = (
+            torch.mean(completion_count)
+        )
+        self.extras["episode"]["static_arm_completion_events"] = (
+            torch.mean(static_completion_count)
+        )
+        self.extras["episode"][
+            "moving_arm_completion_bonus_per_event"
+        ] = torch.mean(
+            completion_bonus_sum
+            / completion_count.clamp_min(1.0)
+        )
         self.extras["episode"]["arm_pos_tol"] = self.settle_pos_tol
         self.extras["episode"]["arm_ori_tol"] = self.settle_ori_tol
         self.extras["episode"]["arm_warmup_active"] = float(
@@ -1542,6 +1593,9 @@ class Go2ArmEnv(BaseTask):
         self.episode_pos_err_sum[env_ids] = 0.
         self.episode_ori_err_sum[env_ids] = 0.
         self.episode_settle_count[env_ids] = 0.
+        self.episode_moving_completion_count[env_ids] = 0.
+        self.episode_static_completion_count[env_ids] = 0.
+        self.episode_moving_completion_bonus_sum[env_ids] = 0.
         if curriculum is not None and curriculum.enabled:
             curriculum_metrics = curriculum.metadata()
             self.extras["episode"]["curriculum_stage"] = (
@@ -1692,6 +1746,141 @@ class Go2ArmEnv(BaseTask):
             + self.cfg.arm.settle.pbrs_ori_weight * self.arm_ori_err_norm
         )
 
+    def _reset_moving_completion_window(self, env_ids):
+        if len(env_ids) == 0:
+            return
+        self.moving_completion_eligible[env_ids] = False
+        self.moving_completion_awarded[env_ids] = False
+        self.moving_completion_hold_counter[env_ids] = 0
+        self.moving_completion_tracking_sum[env_ids] = 0.0
+        self.moving_completion_progress[env_ids] = 0.0
+        self.moving_completion_required[env_ids] = 0.0
+        self.moving_completion_pending_reward[env_ids] = 0.0
+
+    def _tracking_lin_vel_for_commands(self, commands):
+        lin_vel_error = torch.sum(
+            torch.square(commands[:, :2] - self.base_lin_vel[:, :2]),
+            dim=1,
+        )
+        return torch.exp(-lin_vel_error / self.cfg.rewards.tracking_sigma)
+
+    def _update_moving_completion_window(self):
+        """Accumulate the moving-completion criterion over one settle window."""
+        self.moving_completion_pending_reward.zero_()
+        self.moving_completion_event_buf.zero_()
+        self.moving_completion_moving_event_buf.zero_()
+        self.moving_completion_static_event_buf.zero_()
+        self.moving_completion_event_progress_ratio.zero_()
+        self.moving_completion_event_mean_tracking.zero_()
+        active = (
+            self.moving_completion_eligible
+            & self.arm_settle_in_tol
+            & ~self.moving_completion_awarded
+        )
+
+        commands_xy = self.executed_commands_snapshot[:, :2]
+        command_speed = commands_xy.norm(dim=-1)
+        safe_speed = command_speed.clamp_min(1e-6)
+        signed_projection = (
+            self.base_lin_vel[:, :2] * commands_xy
+        ).sum(dim=-1) / safe_speed
+        step_progress = signed_projection * self.dt
+        step_required = command_speed * self.dt
+        step_tracking = self._tracking_lin_vel_for_commands(
+            self.executed_commands_snapshot
+        )
+
+        self.moving_completion_hold_counter = torch.where(
+            active,
+            self.moving_completion_hold_counter + 1,
+            torch.zeros_like(self.moving_completion_hold_counter),
+        )
+        self.moving_completion_tracking_sum = torch.where(
+            active,
+            self.moving_completion_tracking_sum + step_tracking,
+            torch.zeros_like(self.moving_completion_tracking_sum),
+        )
+        self.moving_completion_progress = torch.where(
+            active,
+            self.moving_completion_progress + step_progress,
+            torch.zeros_like(self.moving_completion_progress),
+        )
+        self.moving_completion_required = torch.where(
+            active,
+            self.moving_completion_required + step_required,
+            torch.zeros_like(self.moving_completion_required),
+        )
+
+        hold_steps = max(
+            int(self.cfg.rewards.moving_arm_completion_hold_steps), 1
+        )
+        completed = (
+            self.moving_completion_eligible
+            & self.settle_buf
+            & ~self.moving_completion_awarded
+            & ~self.reset_buf
+            & (self.moving_completion_hold_counter >= hold_steps)
+        )
+        min_speed = float(
+            self.cfg.rewards.moving_arm_completion_min_command_speed
+        )
+        moving = (
+            self.moving_completion_required
+            > min_speed * hold_steps * self.dt
+        )
+        progress_ratio = torch.where(
+            moving,
+            torch.clip(
+                self.moving_completion_progress
+                / self.moving_completion_required.clamp_min(1e-6),
+                0.0,
+                1.0,
+            ),
+            torch.zeros_like(self.moving_completion_progress),
+        )
+        mean_tracking = (
+            self.moving_completion_tracking_sum
+            / self.moving_completion_hold_counter.clamp_min(1).float()
+        )
+        raw_reward = torch.where(
+            moving,
+            mean_tracking * progress_ratio,
+            torch.zeros_like(mean_tracking),
+        )
+        self.moving_completion_pending_reward = torch.where(
+            completed, raw_reward, torch.zeros_like(raw_reward)
+        )
+        self.moving_completion_event_buf.copy_(completed)
+        self.moving_completion_moving_event_buf.copy_(
+            completed & moving
+        )
+        self.moving_completion_static_event_buf.copy_(
+            completed & ~moving
+        )
+        self.moving_completion_event_progress_ratio = torch.where(
+            completed,
+            progress_ratio,
+            torch.zeros_like(progress_ratio),
+        )
+        self.moving_completion_event_mean_tracking = torch.where(
+            completed,
+            mean_tracking,
+            torch.zeros_like(mean_tracking),
+        )
+        self.moving_completion_awarded |= completed
+        self.episode_moving_completion_count += (
+            completed & moving & (progress_ratio > 0.0)
+        ).float()
+        self.episode_static_completion_count += (
+            completed & ~moving
+        ).float()
+        reward_scale = (
+            self.reward_scales.get("task__moving_arm_completion", 0.0)
+        )
+        self.episode_moving_completion_bonus_sum += (
+            self.moving_completion_pending_reward * reward_scale
+        )
+
     def _update_arm_settle(self):
         """每步 reward 之前调用：更新 settle 计数与本步 potential"""
         self._update_arm_err_norms()
@@ -1699,6 +1888,10 @@ class Go2ArmEnv(BaseTask):
         if not self._arm_motion_enabled():
             self.arm_settle_counter.zero_()
             self.settle_buf.zero_()
+            self.arm_settle_in_tol.zero_()
+            self.arm_pos_in_tol.zero_()
+            self.arm_ori_in_tol.zero_()
+            self.arm_trajectory_finished.zero_()
             self.arm_potential_now[:] = self._arm_potential_fn()
             self.arm_pbrs_skip[:] = True
             return
@@ -1710,6 +1903,10 @@ class Go2ArmEnv(BaseTask):
         else:
             trajectory_finished = torch.ones_like(in_pos)
         in_tol = in_pos & in_ori & trajectory_finished
+        self.arm_pos_in_tol.copy_(in_pos)
+        self.arm_ori_in_tol.copy_(in_ori)
+        self.arm_trajectory_finished.copy_(trajectory_finished)
+        self.arm_settle_in_tol.copy_(in_tol)
         self.arm_settle_counter = torch.where(
             in_tol,
             self.arm_settle_counter + 1,
@@ -2371,6 +2568,55 @@ class Go2ArmEnv(BaseTask):
         self.arm_ori_err_norm = torch.zeros(self.num_envs, device=self.device)
         self.arm_settle_counter = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.settle_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.arm_settle_in_tol = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
+        self.arm_pos_in_tol = torch.zeros_like(self.arm_settle_in_tol)
+        self.arm_ori_in_tol = torch.zeros_like(self.arm_settle_in_tol)
+        self.arm_trajectory_finished = torch.zeros_like(
+            self.arm_settle_in_tol
+        )
+        self.executed_commands_snapshot = torch.zeros(
+            self.num_envs,
+            self.cfg.commands.num_commands,
+            device=self.device,
+        )
+        self.moving_completion_eligible = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
+        self.moving_completion_awarded = torch.zeros_like(
+            self.moving_completion_eligible
+        )
+        self.moving_completion_hold_counter = torch.zeros(
+            self.num_envs, dtype=torch.long, device=self.device
+        )
+        self.moving_completion_tracking_sum = torch.zeros(
+            self.num_envs, device=self.device
+        )
+        self.moving_completion_progress = torch.zeros(
+            self.num_envs, device=self.device
+        )
+        self.moving_completion_required = torch.zeros(
+            self.num_envs, device=self.device
+        )
+        self.moving_completion_pending_reward = torch.zeros(
+            self.num_envs, device=self.device
+        )
+        self.moving_completion_event_buf = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
+        self.moving_completion_moving_event_buf = torch.zeros_like(
+            self.moving_completion_event_buf
+        )
+        self.moving_completion_static_event_buf = torch.zeros_like(
+            self.moving_completion_event_buf
+        )
+        self.moving_completion_event_progress_ratio = torch.zeros(
+            self.num_envs, device=self.device
+        )
+        self.moving_completion_event_mean_tracking = torch.zeros(
+            self.num_envs, device=self.device
+        )
         # PBRS potential: 上一步末尾（resample/reset 后）刷新的 phi
         self.arm_potential = torch.zeros(self.num_envs, device=self.device)
         # 本步 reward 前计算的 phi（与本步命令同口径）
@@ -2392,6 +2638,15 @@ class Go2ArmEnv(BaseTask):
         self.episode_pos_err_sum = torch.zeros(self.num_envs, device=self.device)
         self.episode_ori_err_sum = torch.zeros(self.num_envs, device=self.device)
         self.episode_settle_count = torch.zeros(self.num_envs, device=self.device)
+        self.episode_moving_completion_count = torch.zeros(
+            self.num_envs, device=self.device
+        )
+        self.episode_static_completion_count = torch.zeros(
+            self.num_envs, device=self.device
+        )
+        self.episode_moving_completion_bonus_sum = torch.zeros(
+            self.num_envs, device=self.device
+        )
 
         # 可视化 / reward 用
         self.target_rpy = torch.zeros(self.num_envs, 3, dtype=torch.float, device=self.device, requires_grad=False)
@@ -3121,6 +3376,11 @@ class Go2ArmEnv(BaseTask):
         # 一次性稀疏 bonus：误差连续 hold_steps 步在容差内（settle 当步发放，
         # 随后立即重采样新目标，所以每个 settle 事件只发一次）
         return self.settle_buf.float()
+
+    def _reward_moving_arm_completion(self):
+        reward = self.moving_completion_pending_reward.clone()
+        self.moving_completion_pending_reward.zero_()
+        return reward
 
     def _reward_arm_pbrs_progress(self):
         # potential-based shaping: gamma*phi(s') - phi(s)，理论上不改变最优策略

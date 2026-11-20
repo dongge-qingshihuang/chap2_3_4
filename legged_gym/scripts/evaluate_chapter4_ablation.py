@@ -33,7 +33,17 @@ DEFAULT_OUTPUT = (
     / "chapter4_evaluation"
     / "results.json"
 )
-MODES = ("B0", "B1", "B2", "B3", "B4", "B0F")
+MODES = (
+    "B0",
+    "B1",
+    "B2",
+    "B3",
+    "B3R",
+    "B3M",
+    "B3RM",
+    "B4",
+    "B0F",
+)
 TERRAINS = ("flat", "rough")
 
 
@@ -53,6 +63,8 @@ def parse_args():
     parser.add_argument("--steps", type=int, default=600)
     parser.add_argument("--seed", type=int, default=20261118)
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--joint-min-progress", type=float, default=0.8)
+    parser.add_argument("--joint-min-tracking", type=float, default=0.7)
     return parser.parse_args()
 
 
@@ -274,6 +286,15 @@ def evaluate_single(args):
         "low_base_steps": 0,
         "healthy_steps": 0,
         "healthy_base_height": 0.0,
+        "arm_trajectory_finished_steps": 0,
+        "arm_position_in_tol_steps": 0,
+        "arm_orientation_in_tol_steps": 0,
+        "arm_hold_steps": 0,
+        "arm_settle_events": 0,
+        "moving_arm_completion_events": 0,
+        "static_arm_completion_events": 0,
+        "joint_pass_events": 0,
+        "arm_trajectory_attempts": int(env.num_envs),
     }
 
     for _ in range(args.steps):
@@ -281,6 +302,8 @@ def evaluate_single(args):
         normalized_obs = runner.obs_normalizer(observations)
         actions = policy(normalized_obs)
         previous_xy = env.root_states[:, :2].clone()
+        previous_target_quat = env.arm_traj_end_quat.clone()
+        previous_target_lpy = env.arm_traj_end_lpy.clone()
         (
             observations,
             _,
@@ -292,6 +315,27 @@ def evaluate_single(args):
         ) = env.step(actions)
 
         valid = ~dones.bool()
+        target_changed = (
+            (
+                1.0
+                - torch.abs(
+                    (
+                        previous_target_quat
+                        * env.arm_traj_end_quat
+                    ).sum(dim=-1)
+                )
+            ).abs()
+            > 1e-6
+        ) | (
+            torch.norm(
+                previous_target_lpy - env.arm_traj_end_lpy,
+                dim=-1,
+            )
+            > 1e-6
+        )
+        total["arm_trajectory_attempts"] += int(
+            target_changed.sum().item()
+        )
         count = int(valid.sum().item())
         if count > 0:
             linear_error = torch.norm(
@@ -331,6 +375,54 @@ def evaluate_single(args):
                 env.root_states[valid, 2].sum().item()
             )
             total["reward"] += rewards[valid].sum().item()
+            total["arm_trajectory_finished_steps"] += int(
+                (
+                    env.arm_trajectory_finished[valid]
+                ).sum().item()
+            )
+            total["arm_position_in_tol_steps"] += int(
+                (env.arm_pos_in_tol[valid]).sum().item()
+            )
+            total["arm_orientation_in_tol_steps"] += int(
+                (env.arm_ori_in_tol[valid]).sum().item()
+            )
+            total["arm_hold_steps"] += int(
+                (env.arm_settle_in_tol[valid]).sum().item()
+            )
+            settle_event = (
+                valid & env.moving_completion_event_buf
+            )
+            total["arm_settle_events"] += int(
+                settle_event.sum().item()
+            )
+            moving_event = (
+                settle_event
+                & env.moving_completion_moving_event_buf
+            )
+            static_event = (
+                settle_event
+                & env.moving_completion_static_event_buf
+            )
+            total["moving_arm_completion_events"] += int(
+                moving_event.sum().item()
+            )
+            total["static_arm_completion_events"] += int(
+                static_event.sum().item()
+            )
+            joint_pass = (
+                moving_event
+                & (
+                    env.moving_completion_event_mean_tracking
+                    >= args.joint_min_tracking
+                )
+                & (
+                    env.moving_completion_event_progress_ratio
+                    >= args.joint_min_progress
+                )
+            )
+            total["joint_pass_events"] += int(
+                joint_pass.sum().item()
+            )
             base_height = env._get_base_heights()
             healthy = (
                 valid
@@ -421,6 +513,7 @@ def evaluate_single(args):
     healthy_steps = max(total["healthy_steps"], 1)
     episodes = max(total["episodes"], 1)
     distance = max(total["distance"], 1e-6)
+    arm_attempts = max(total["arm_trajectory_attempts"], 1)
     result = {
         "mode": args.mode,
         "terrain": args.terrain,
@@ -471,6 +564,34 @@ def evaluate_single(args):
         "base_height_below_0_25_rate": (
             total["low_base_steps"] / steps
         ),
+        "arm_trajectory_finished_fraction": (
+            total["arm_trajectory_finished_steps"] / steps
+        ),
+        "arm_position_in_tol_fraction": (
+            total["arm_position_in_tol_steps"] / steps
+        ),
+        "arm_orientation_in_tol_fraction": (
+            total["arm_orientation_in_tol_steps"] / steps
+        ),
+        "arm_hold_fraction": total["arm_hold_steps"] / steps,
+        "arm_trajectory_attempts": total["arm_trajectory_attempts"],
+        "arm_settle_events": total["arm_settle_events"],
+        "moving_arm_completion_events": (
+            total["moving_arm_completion_events"]
+        ),
+        "static_arm_completion_events": (
+            total["static_arm_completion_events"]
+        ),
+        "moving_completion_rate": (
+            total["moving_arm_completion_events"] / arm_attempts
+        ),
+        "static_completion_rate": (
+            total["static_arm_completion_events"] / arm_attempts
+        ),
+        "joint_pass_events": total["joint_pass_events"],
+        "joint_pass_rate": total["joint_pass_events"] / arm_attempts,
+        "joint_min_progress": args.joint_min_progress,
+        "joint_min_tracking": args.joint_min_tracking,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     result_path = args.output.parent / (
@@ -507,6 +628,10 @@ def run_all(args):
                 str(args.seed),
                 "--device",
                 "cuda:0",
+                "--joint-min-progress",
+                str(args.joint_min_progress),
+                "--joint-min-tracking",
+                str(args.joint_min_tracking),
             ]
             environment = os.environ.copy()
             environment["GO2_ARM_EXPERIMENT"] = mode

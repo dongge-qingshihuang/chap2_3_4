@@ -1,6 +1,6 @@
 # Chapter 4 Ablation Training Report
 
-Snapshot time: 2026-11-17 20:36 Asia/Shanghai
+Snapshot time: 2026-11-20 Asia/Shanghai
 
 > **Formal run status:** The first formal queue exposed an unbounded action
 > standard deviation and was stopped. It remains the failure-analysis baseline.
@@ -274,13 +274,18 @@ New stability reward:
   so narrow stances receive a penalty
 
 The first implementation accidentally returned a negative shortfall and was
-stopped after two updates. The corrected run starts in:
+stopped after two updates. A corrected run was launched at
+`legged_gym/logs/chapter4_full_111_foot_spacing_v2`, but it was superseded when
+the baseline was corrected to the Chap3 obs-normalized LiftSpacing checkpoint.
+Its log artifacts were removed in the 2026-11-20 cleanup. The active replacement
+run is:
 
-`legged_gym/logs/chapter4_full_111_foot_spacing_v2`
+`legged_gym/logs/chapter4_full_obsnorm_warmup_v6`
 
 Training configuration for this full run:
 
-- baseline: `legged_gym/logs/111/model_14999.pt`
+- baseline:
+  `legged_gym/base_policies/go2_terrain_moe_tcn_gate_v2_obsnorm/model_14999.pt`
 - empirical observation normalization: enabled
 - mode: B0 full method
 - updates: 8000
@@ -315,6 +320,161 @@ Remaining issues or caveats:
 3. Foot-spacing is evaluated every control step, including swing. It therefore
    shapes both support width and swing-foot separation rather than only the
    support polygon.
+
+### Obs-normalized checkpoint migration audit
+
+The file originally placed in `logs/111` was verified by SHA-256 to be the
+Chap3 **non-obsnorm** `foot_lift_spacing` checkpoint:
+
+```text
+88cca34ddc4967d914211e908b64c60d7a26c04ac036f0563d76c97333a32758
+```
+
+The intended obs-normalized baseline is:
+
+```text
+chap3/logs/go2_terrain_moe_tcn_gate_v2_obsnorm/
+Nov19_12-19-47_obsnorm_lift_spacing_s0/model_14999.pt
+```
+
+It was copied into:
+
+`legged_gym/base_policies/go2_terrain_moe_tcn_gate_v2_obsnorm/model_14999.pt`
+
+Migration checks:
+
+- actor/perception transfer: 271 parameters, strict verification passed.
+- old `std` converted to bounded `log_std`.
+- 45-D observation-normalization state found and loaded.
+- normalizer sample count: `100024320`.
+- source command semantics restored to `heading_command=True`.
+- Chapter 4 pipeline completes successfully.
+
+The checkpoint itself is healthy in its source environment. With the confirmed
+`heading_command=True` training semantics, Chap3 row-3 stairs-up, stairs-down,
+slope-up, and slope-down evaluation achieved 100% success and 0% fall.
+
+However, behavioral transfer to the Go2+ARX5 environment is not immediate:
+
+- within 5 PPO updates, fall termination reached about 95%;
+- roll termination remained above 80%;
+- base height fell to roughly 0.19 m;
+- linear tracking fell to roughly 0.10-0.15.
+
+Therefore:
+
+```text
+File migration:              successful
+Weight migration:            successful
+Normalization migration:     successful
+Behavioral morphology transfer: failed
+```
+
+The immediate behavioral failure is consistent with the checkpoint being
+trained on the Go2-only URDF while the Chapter 4 environment adds the ARX5
+mass, inertia, and changing arm pose. Direct adaptation is now evaluated through
+the existing 1000-update fixed-arm warmup together with the zero-initialized
+arm-reference residual described below; these startup metrics are therefore not
+by themselves evidence that the checkpoint cannot be adapted.
+
+### B3R arm-reference base-action residual
+
+`B3R` keeps the Chap3 actor deterministic output as the base leg action and
+adds a small learned correction:
+
+```text
+leg action = Chap3 actor mean + bounded residual
+```
+
+The residual branch uses:
+
+- the 80-D B3 actor feature: current 45-D proprio observation, 32-D fused
+  control latent, and 3-D velocity estimate;
+- the current 6-D arm joint position error;
+- the current 6-D arm joint velocity;
+- the current control step's 6-D IK-reference joint velocity already computed
+  by the environment as `arm_target_vel`.
+
+The 18-D arm inputs use the environment's existing position and velocity
+observation scales and are stored per transition for the PPO update. The final
+residual layer is zero-initialized. Therefore the initial deterministic policy
+is exactly the Chap3 actor output. Residuals are bounded by
+`0.1 * tanh(...)` in action units, corresponding to at most `0.025 rad` of leg
+joint-target correction at the current `action_scale=0.25`.
+
+The 9-D estimated payload is deliberately excluded from this first version and
+remains a separate future increment. The original 900-D actor history layout is
+unchanged; only the side-channel 18-D arm state is stored alongside the action.
+
+The first version uses B3's non-dynamic critic configuration with fixed
+`[0.7, 0.2, 0.1]` task/stability/energy advantage weights. The pretrained
+Chap3 actor, control adapters, gate, temporal encoder, and action standard
+deviation are frozen. PPO trains the residual branch and critic heads; the
+payload estimator continues to train through its dedicated supervision loss.
+
+The four controlled groups are:
+
+- `B3`: original fixed-weight reference;
+- `B3R`: B3 plus the arm-conditioned residual;
+- `B3M`: B3 plus the moving-arm completion reward;
+- `B3RM`: B3 plus both modules.
+
+Smoke checks pass for zero-output initialization, bounded residual output,
+residual-only gradients, storage round-trip, checkpoint initialization, joint
+completion reward edge cases, and a full environment/PPO update.
+
+The earlier run at `chapter4_b3r_armref_residual_v2` used the superseded
+`9-D payload + 18-D arm + 0.5 clip` implementation. It was stopped and is not a
+result for the current method. No replacement training run has been launched.
+
+### Moving-arm completion reward
+
+`task__moving_arm_completion` fires once per arm trajectory after:
+
+- the local reference trajectory has finished;
+- position and orientation remain inside their current settle tolerances for
+  15 consecutive control steps;
+- the step is not a reset or termination;
+- the trajectory has not already received this event.
+
+For the same 15-step window, the implementation accumulates:
+
+- mean linear velocity tracking reward;
+- signed displacement along the active command direction;
+- commanded distance.
+
+The raw event reward is:
+
+```text
+mean_linear_tracking * clip(signed_progress / required_progress, 0, 1)
+```
+
+The executed command is snapshotted at the beginning of each physics step before
+command resampling. Tolerance interruption, target replacement, and reset clear
+the window. Near-zero commanded distance receives zero reward and is logged as a
+separate static completion. With `b=0.2`, the configured scale is `b/dt=10`, so
+after the standard reward-scale `dt` multiplication one full event contributes
+exactly `0.2`.
+
+The independent evaluator now also records trajectory-finished, position,
+orientation, hold, settle-event, moving/static completion, and joint-pass
+metrics. Joint pass requires the moving completion event, mean tracking at least
+`0.7`, and progress ratio at least `0.8` by default.
+
+Dashboard scalars:
+
+- `BaseActionResidual/mean_abs`
+- `BaseActionResidual/max_abs`
+- `BaseActionResidual/saturation_fraction`
+- `Episode/moving_arm_completion_events`
+- `Episode/static_arm_completion_events`
+- `Episode/moving_arm_completion_bonus_per_event`
+
+`max_abs` is the maximum over all environments and leg joints and therefore
+approaches the bound as soon as one value is strongly saturated. It should not
+be interpreted as the whole residual being clipped. The useful diagnostic is
+`saturation_fraction`, the fraction of residual elements inside one percent of
+the bound.
 
 ## Superseded Formal Snapshot
 

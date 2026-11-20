@@ -56,12 +56,14 @@ class HIMRolloutStorage:
             self.base_actions_log_prob = None
             self.base_action_mean = None
             self.base_action_sigma = None
+            self.residual_context = None
 
         def clear(self):
             self.__init__()
 
     def __init__(self, num_envs, num_transitions_per_env, obs_shape, privileged_obs_shape, actions_shape, device='cpu',
-                 base_obs_shape=None, base_actions_shape=None, value_dim=1):
+                 base_obs_shape=None, base_actions_shape=None,
+                 residual_context_shape=None, value_dim=1):
 
         self.device = device
 
@@ -79,6 +81,15 @@ class HIMRolloutStorage:
             self.base_actions_log_prob = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
             self.base_mu = torch.zeros(num_transitions_per_env, num_envs, *base_actions_shape, device=self.device)
             self.base_sigma = torch.zeros(num_transitions_per_env, num_envs, *base_actions_shape, device=self.device)
+
+        self.store_residual_context = residual_context_shape is not None
+        if self.store_residual_context:
+            self.residual_context = torch.zeros(
+                num_transitions_per_env,
+                num_envs,
+                *residual_context_shape,
+                device=self.device,
+            )
 
         # Core
         self.observations = torch.zeros(num_transitions_per_env, num_envs, *obs_shape, device=self.device)
@@ -181,6 +192,14 @@ class HIMRolloutStorage:
             self.base_actions_log_prob[self.step].copy_(transition.base_actions_log_prob.view(-1, 1))
             self.base_mu[self.step].copy_(transition.base_action_mean)
             self.base_sigma[self.step].copy_(transition.base_action_sigma)
+        if self.store_residual_context:
+            if transition.residual_context is None:
+                raise RuntimeError(
+                    "Residual context is required by rollout storage"
+                )
+            self.residual_context[self.step].copy_(
+                transition.residual_context
+            )
         self.step += 1
 
     def clear(self):
@@ -304,6 +323,9 @@ class HIMRolloutStorage:
             base_old_mu = self.base_mu.flatten(0, 1)
             base_old_sigma = self.base_sigma.flatten(0, 1)
 
+        if self.store_residual_context:
+            residual_context = self.residual_context.flatten(0, 1)
+
         for epoch in range(num_epochs):
             for i in range(num_mini_batches):
 
@@ -344,6 +366,12 @@ class HIMRolloutStorage:
                 else:
                     base_batch = (None, None, None, None, None)
 
+                residual_context_batch = (
+                    residual_context[batch_idx]
+                    if self.store_residual_context
+                    else None
+                )
+
                 yield (
                     obs_batch,
                     critic_observations_batch,
@@ -361,4 +389,5 @@ class HIMRolloutStorage:
                     load_weight_smooth_mask_batch,
                     payload_predictions_batch,
                     base_batch,
+                    residual_context_batch,
                 )

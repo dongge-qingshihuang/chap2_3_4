@@ -42,6 +42,7 @@ class HIMOnPolicyRunner:
 
         self.num_actor_obs = self.env.num_obs
         self.num_critic_obs = num_critic_obs
+        self._pretrained_obs_normalizer_state = None
 
         self.policy_class_name = self.cfg["policy_class_name"]
         actor_critic_class = eval(self.policy_class_name)
@@ -101,6 +102,9 @@ class HIMOnPolicyRunner:
                 expert_lr_multiplier=self.cfg.get(
                     "expert_lr_multiplier", 0.1
                 ),
+                freeze_actor=self.cfg.get(
+                    "freeze_pretrained_actor", False
+                ),
             )
         elif self.policy_class_name.startswith("ActorCriticArmServoDogPrior"):
             # 这两个网络的签名是 (..., num_one_step_obs, history_length, activation)，
@@ -159,6 +163,15 @@ class HIMOnPolicyRunner:
             self.critic_obs_normalizer = EmpiricalNormalization(
                 shape=[num_critic_obs], until=1.0e8
             ).to(self.device)
+            if self._pretrained_obs_normalizer_state is not None:
+                with torch.inference_mode():
+                    self.obs_normalizer.load_state_dict(
+                        self._pretrained_obs_normalizer_state
+                    )
+                print(
+                    "[PretrainedPolicy] initialized observation normalizer "
+                    "from checkpoint"
+                )
         else:
             self.obs_normalizer = torch.nn.Identity().to(self.device)
             self.critic_obs_normalizer = torch.nn.Identity().to(self.device)
@@ -182,6 +195,24 @@ class HIMOnPolicyRunner:
             base_obs_shape = [self.env.num_base_residual_obs]
             base_actions_shape = [self.env.num_dog_actions]
 
+        self.residual_context_dim = int(
+            getattr(
+                self.alg.actor_critic,
+                "base_action_residual_context_dim",
+                0,
+            )
+            if getattr(
+                self.alg.actor_critic,
+                "base_action_residual_enabled",
+                False,
+            )
+            else 0
+        )
+        self.residual_context_shape = (
+            [self.residual_context_dim]
+            if self.residual_context_dim > 0
+            else None
+        )
         self.alg.init_storage(
             self.env.num_envs,
             self.num_steps_per_env,
@@ -190,6 +221,7 @@ class HIMOnPolicyRunner:
             [self.train_action_dim],
             base_obs_shape=base_obs_shape,
             base_actions_shape=base_actions_shape,
+            residual_context_shape=self.residual_context_shape,
         )
 
         self.log_dir = log_dir
@@ -222,6 +254,15 @@ class HIMOnPolicyRunner:
                 f"expected {expected_version}, "
                 f"got {checkpoint.get('architecture_version')}"
             )
+        self._pretrained_obs_normalizer_state = (
+            checkpoint.get("obs_normalizer_state_dict")
+            or checkpoint.get("obs_norm_state_dict")
+        )
+        if self._pretrained_obs_normalizer_state is not None:
+            print(
+                "[PretrainedPolicy] found pretrained observation "
+                "normalization statistics"
+            )
 
         base_policy_cfg = self.cfg.get("base_policy", {})
         pretrained_model = TerrainMoeActorCritic(
@@ -244,6 +285,7 @@ class HIMOnPolicyRunner:
             "critic_heads.",
             "payload_estimator.",
             "load_weight_net.",
+            "base_action_residual.",
         )
         unexpected_new = [
             key
@@ -327,7 +369,18 @@ class HIMOnPolicyRunner:
                         if self.train_base:
                             self._act_base_residual(inference=False)
 
-                    actions = self.alg.act(obs, critic_obs)
+                    residual_context = (
+                        self.env.get_base_action_residual_obs().to(
+                            self.device
+                        )
+                        if self.residual_context_shape is not None
+                        else None
+                    )
+                    actions = self.alg.act(
+                        obs,
+                        critic_obs,
+                        residual_context=residual_context,
+                    )
 
                     obs, privileged_obs, rewards, dones, infos, termination_ids, termination_privileged_obs = self.env.step(actions)
 
@@ -595,6 +648,32 @@ class HIMOnPolicyRunner:
             self.writer.add_scalar('BaseResidual/base_height', self.env.root_states[:, 2].mean().item(), locs['it'])
             if hasattr(self.env, 'pitch'):
                 self.writer.add_scalar('BaseResidual/base_pitch_abs', self.env.pitch.abs().mean().item(), locs['it'])
+        action_residual = getattr(
+            self.alg.actor_critic, "last_action_residual", None
+        )
+        if action_residual is not None:
+            self.writer.add_scalar(
+                "BaseActionResidual/mean_abs",
+                action_residual.abs().mean().item(),
+                locs["it"],
+            )
+            self.writer.add_scalar(
+                "BaseActionResidual/max_abs",
+                action_residual.abs().max().item(),
+                locs["it"],
+            )
+            self.writer.add_scalar(
+                "BaseActionResidual/saturation_fraction",
+                (
+                    action_residual.abs()
+                    >= 0.99
+                    * self.alg.actor_critic.base_action_residual_clip
+                )
+                .float()
+                .mean()
+                .item(),
+                locs["it"],
+            )
         self.writer.add_scalar('Policy/mean_noise_std', mean_std.item(), locs['it'])
         self.writer.add_scalar(
             'Policy/min_noise_std', std_values.min().item(), locs['it']
@@ -747,9 +826,13 @@ class HIMOnPolicyRunner:
             # Rollout buffers may contain inference tensors under PyTorch 1.10.
             # Loading within inference mode permits their in-place copy.
             with torch.inference_mode():
-                if loaded_dict.get("obs_norm_state_dict") is not None:
+                obs_norm_state = (
+                    loaded_dict.get("obs_norm_state_dict")
+                    or loaded_dict.get("obs_normalizer_state_dict")
+                )
+                if obs_norm_state is not None:
                     self.obs_normalizer.load_state_dict(
-                        loaded_dict["obs_norm_state_dict"]
+                        obs_norm_state
                     )
                 else:
                     print(
@@ -797,7 +880,22 @@ class HIMOnPolicyRunner:
         self.alg.actor_critic.eval() # switch to evaluation mode (dropout for example)
         if device is not None:
             self.alg.actor_critic.to(device)
+        if getattr(
+            self.alg.actor_critic,
+            "base_action_residual_enabled",
+            False,
+        ):
+            return self._inference_policy_with_residual_context
         return self.alg.actor_critic.act_inference
+
+    def _inference_policy_with_residual_context(self, observations):
+        residual_context = self.env.get_base_action_residual_obs().to(
+            self.device
+        )
+        return self.alg.actor_critic.act_inference(
+            observations,
+            residual_context=residual_context,
+        )
 
     def _extract_model_state_dict(self, ckpt):
         if not isinstance(ckpt, dict):
