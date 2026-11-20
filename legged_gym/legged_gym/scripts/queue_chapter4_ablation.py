@@ -37,6 +37,17 @@ def parse_args():
     parser.add_argument("--log-root", type=Path, default=DEFAULT_LOG_ROOT)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--status", action="store_true")
+    parser.add_argument(
+        "--wait-for-pid",
+        type=int,
+        default=None,
+        help="Wait for this process to exit before scheduling jobs.",
+    )
+    parser.add_argument(
+        "--wait-poll-seconds",
+        type=float,
+        default=30.0,
+    )
     return parser.parse_args()
 
 
@@ -67,6 +78,26 @@ def print_status(manifest_path):
             f"{job.get('finished_at') or '-'} "
             f"rc={job.get('returncode')}"
         )
+
+
+def pid_is_active(pid):
+    stat_path = Path(f"/proc/{pid}/stat")
+    try:
+        fields = stat_path.read_text(encoding="utf-8").split()
+    except FileNotFoundError:
+        return False
+    if len(fields) >= 3 and fields[2] == "Z":
+        return False
+    return True
+
+
+def wait_for_pid(pid, poll_seconds):
+    if pid is None or not pid_is_active(pid):
+        return
+    print(f"[QUEUE] waiting for PID {pid} to finish", flush=True)
+    while pid_is_active(pid):
+        time.sleep(max(float(poll_seconds), 1.0))
+    print(f"[QUEUE] PID {pid} finished; scheduling jobs", flush=True)
 
 
 def main():
@@ -133,6 +164,7 @@ def main():
             )
         return
 
+    wait_for_pid(args.wait_for_pid, args.wait_poll_seconds)
     write_manifest(manifest_path, jobs)
     processes = {}
     pending = list(range(len(jobs)))

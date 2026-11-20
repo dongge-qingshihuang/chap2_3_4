@@ -284,6 +284,48 @@ class Chapter4PolicyTest(unittest.TestCase):
             )
         )
 
+    def test_residual_and_dynamic_load_weights_coexist(self):
+        model = TerrainMoeActorCritic(
+            900,
+            251,
+            12,
+            45,
+            None,
+            20,
+            **pretrained_kwargs(),
+            num_critics=3,
+            payload_dim=9,
+            payload_hidden_dims=(32, 16),
+            load_aware_enabled=True,
+            base_action_residual_enabled=True,
+            base_action_residual_context_dim=18,
+            base_action_residual_hidden_dims=(32, 16),
+        ).configure_finetune(
+            "full",
+            expert_freeze=False,
+            freeze_actor=False,
+        )
+        observations = torch.randn(4, 900)
+        context = torch.randn(4, 18)
+        model.zero_grad(set_to_none=True)
+        actions = model.act(
+            observations, residual_context=context
+        )
+        model.get_actions_log_prob(actions).mean().backward()
+        self.assertEqual(
+            tuple(model.get_load_weights().shape), (4, 3)
+        )
+        self.assertIsNotNone(model.actor[0].weight.grad)
+        self.assertIsNone(
+            model.load_weight_net.net[0].weight.grad
+        )
+        self.assertTrue(
+            any(
+                parameter.grad is not None
+                for parameter in model.base_action_residual.parameters()
+            )
+        )
+
     def test_full_mode_can_unfreeze_experts_and_ema_stays_frozen(self):
         model = self.build_trainable_model()
         model.configure_finetune("full", expert_freeze=False)

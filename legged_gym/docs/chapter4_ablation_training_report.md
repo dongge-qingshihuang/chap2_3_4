@@ -420,6 +420,7 @@ The four controlled groups are:
 - `B3R`: B3 plus the arm-conditioned residual;
 - `B3M`: B3 plus the moving-arm completion reward;
 - `B3RM`: B3 plus both modules and full pretrained-base fine-tuning.
+- `B3RMD`: `B3RM` with dynamic load-aware critic weights.
 
 Smoke checks pass for zero-output initialization, bounded residual output,
 residual-only gradients, storage round-trip, checkpoint initialization, joint
@@ -427,7 +428,14 @@ completion reward edge cases, and a full environment/PPO update.
 
 The earlier run at `chapter4_b3r_armref_residual_v2` used the superseded
 `9-D payload + 18-D arm + 0.5 clip` implementation. It was stopped and is not a
-result for the current method. No replacement training run has been launched.
+result for the current method. The active replacement with full pretrained-base
+fine-tuning is:
+
+`legged_gym/logs/chapter4_b3rm_fullbase_v3`
+
+`B3RMD` is queued after that run on the same GPU. Its actor, residual, online
+experts, velocity estimator, and critics use the same full fine-tuning scope,
+while load weights and their supervision are enabled.
 
 ### Moving-arm completion reward
 
