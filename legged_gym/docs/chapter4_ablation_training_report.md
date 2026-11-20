@@ -421,6 +421,8 @@ The four controlled groups are:
 - `B3M`: B3 plus the moving-arm completion reward;
 - `B3RM`: B3 plus both modules and full pretrained-base fine-tuning.
 - `B3RMD`: `B3RM` with dynamic load-aware critic weights.
+- `B4R`: from-scratch training with three critics, dynamic load-aware weights,
+  the arm-conditioned residual, and no pretrained checkpoint.
 
 Smoke checks pass for zero-output initialization, bounded residual output,
 residual-only gradients, storage round-trip, checkpoint initialization, joint
@@ -436,6 +438,10 @@ fine-tuning is:
 `B3RMD` is queued after that run on the same GPU. Its actor, residual, online
 experts, velocity estimator, and critics use the same full fine-tuning scope,
 while load weights and their supervision are enabled.
+
+`B4R` follows `B3RMD` in the same single-GPU queue. It starts from random
+initialization, keeps the moving-completion reward disabled, and enables the
+three-critic dynamic weighting plus the arm-conditioned residual.
 
 ### Moving-arm completion reward
 

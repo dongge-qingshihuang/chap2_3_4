@@ -102,6 +102,13 @@ _ABLATION_CONFIGS = {
                weight_supervision=1.0, weight_smooth=0.01,
                trajectory_curriculum=True, pretrained=False,
                finetune_mode="full", expert_freeze=False),
+    "B4R": dict(multi_critic=True, payload_aware=True, load_aware=True,
+                weight_supervision=1.0, weight_smooth=0.01,
+                trajectory_curriculum=True, pretrained=False,
+                base_action_residual=True,
+                freeze_pretrained_actor=False,
+                finetune_mode="full", expert_freeze=False,
+                moving_arm_completion_reward=False),
     # Supplementary control for B4: same full unfreeze scope, but initialized
     # from V2. Use B0F vs B4 to isolate pretraining without a freeze mismatch.
     "B0F": dict(multi_critic=True, payload_aware=True, load_aware=True,
