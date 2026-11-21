@@ -35,6 +35,7 @@ DEFAULT_OUTPUT = (
 )
 MODES = (
     "B0",
+    "B0R",
     "B1",
     "B2",
     "B3",

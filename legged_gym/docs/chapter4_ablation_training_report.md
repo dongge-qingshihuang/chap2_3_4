@@ -423,6 +423,8 @@ The four controlled groups are:
 - `B3RMD`: `B3RM` with dynamic load-aware critic weights.
 - `B4R`: from-scratch training with three critics, dynamic load-aware weights,
   the arm-conditioned residual, and no pretrained checkpoint.
+- `B0R`: the original B0 dynamic-critic configuration plus the
+  arm-conditioned residual, without the moving-completion reward.
 
 Smoke checks pass for zero-output initialization, bounded residual output,
 residual-only gradients, storage round-trip, checkpoint initialization, joint
@@ -442,6 +444,9 @@ while load weights and their supervision are enabled.
 `B4R` follows `B3RMD` in the same single-GPU queue. It starts from random
 initialization, keeps the moving-completion reward disabled, and enables the
 three-critic dynamic weighting plus the arm-conditioned residual.
+
+`B0R` preserves B0's partial fine-tuning scope and dynamic critic weighting,
+adds only the arm-conditioned residual, and is trained for 20000 updates.
 
 ### Moving-arm completion reward
 
