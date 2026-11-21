@@ -41,6 +41,8 @@ MODES = (
     "B3R",
     "B3M",
     "B3RM",
+    "B3RMD",
+    "B4R",
     "B4",
     "B0F",
 )
