@@ -22,6 +22,9 @@ def main():
     args.run_name = os.environ.get(
         "CHAPTER4_RUN_NAME", f"{mode}_s0"
     )
+    resume_checkpoint = os.environ.get(
+        "CHAPTER4_RESUME_CHECKPOINT", ""
+    )
     if os.environ.get("CHAPTER4_RESUME", "0") == "1":
         args.resume = True
 
@@ -32,6 +35,17 @@ def main():
         args=args,
         log_root=os.environ.get("CHAPTER4_LOG_ROOT", "default"),
     )
+    if resume_checkpoint:
+        resume_checkpoint = os.path.abspath(
+            os.path.expanduser(resume_checkpoint)
+        )
+        if not os.path.isfile(resume_checkpoint):
+            raise FileNotFoundError(resume_checkpoint)
+        print(
+            f"[Resume] loading explicit checkpoint: {resume_checkpoint}",
+            flush=True,
+        )
+        runner.load(resume_checkpoint)
     print(
         "[Ablation] "
         f"mode={mode} "
