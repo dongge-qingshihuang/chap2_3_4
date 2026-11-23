@@ -106,6 +106,7 @@ class HIMOnPolicyRunner:
                     "freeze_pretrained_actor", False
                 ),
             )
+            actor_critic.enforce_std_bounds()
         elif self.policy_class_name.startswith("ActorCriticArmServoDogPrior"):
             # 这两个网络的签名是 (..., num_one_step_obs, history_length, activation)，
             # 与下面的六位置参数形式不兼容，必须按关键字传

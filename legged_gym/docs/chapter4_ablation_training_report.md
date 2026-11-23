@@ -277,6 +277,13 @@ The retraining configuration softens spacing shaping from `-2.0` to `-1.0` and
 leg smoothness from `-0.01` to `-0.005` to allow more flexible support
 adjustments and faster disturbance responses.
 
+The first 20k run with these softer shaping terms was stopped after actor KL
+repeatedly exceeded 10 and action standard deviation remained at the `0.5`
+upper bound. The stabilized B0 rerun uses only B0-specific optimizer overrides:
+`max_noise_std=0.30`, `entropy_coef=0.002`, and
+`actor_lr_multiplier=0.5`. The reward scales themselves are unchanged between
+the two runs.
+
 The first implementation accidentally returned a negative shortfall and was
 stopped after two updates. A corrected run was launched at
 `legged_gym/logs/chapter4_full_111_foot_spacing_v2`, but it was superseded when

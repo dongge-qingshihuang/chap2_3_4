@@ -63,7 +63,9 @@ _ABLATION_CONFIGS = {
     # Final paper ablations: each mode removes exactly one Chapter 4 module.
     "B0": dict(multi_critic=True, payload_aware=True, load_aware=True,
                weight_supervision=1.0, weight_smooth=0.01,
-               trajectory_curriculum=True, pretrained=True),
+               trajectory_curriculum=True, pretrained=True,
+               actor_lr_multiplier=0.5, entropy_coef=0.002,
+               entropy_coef_final=0.002, max_noise_std=0.30),
     "B0R": dict(multi_critic=True, payload_aware=True, load_aware=True,
                 weight_supervision=1.0, weight_smooth=0.01,
                 trajectory_curriculum=True, pretrained=True,
@@ -205,8 +207,15 @@ PRETRAINED_POLICY_FINETUNE_MODE = _ABLATION.get(
 EXPERT_FREEZE = _ABLATION.get("expert_freeze", True)
 GATE_LR_MULTIPLIER = 0.25
 ADAPTER_LR_MULTIPLIER = 0.25
-ACTOR_LR_MULTIPLIER = 1.0
+ACTOR_LR_MULTIPLIER = float(
+    _ABLATION.get("actor_lr_multiplier", 1.0)
+)
 EXPERT_LR_MULTIPLIER = 0.1
+ENTROPY_COEF = float(_ABLATION.get("entropy_coef", 0.01))
+ENTROPY_COEF_FINAL = float(
+    _ABLATION.get("entropy_coef_final", 0.002)
+)
+MAX_NOISE_STD = float(_ABLATION.get("max_noise_std", 0.5))
 ARM_TRAJECTORY_CURRICULUM = _ABLATION.get(
     "trajectory_curriculum", True
 )
@@ -587,8 +596,8 @@ class Go2ArmRoughCfgPPO( LeggedRobotCfgPPO ):
     class algorithm( LeggedRobotCfgPPO.algorithm ):
         # entropy 退火：前期 0.01 保证探索/课程启动，后期降到 0.002 让 std 下降，
         # 末端噪声安静后才能在容差内 hold 住（前 25% 迭代恒定，之后线性退火）
-        entropy_coef = 0.01
-        entropy_coef_final = 0.002
+        entropy_coef = ENTROPY_COEF
+        entropy_coef_final = ENTROPY_COEF_FINAL
         entropy_anneal_start_frac = 0.25
         # 固定权重仅用于 B/C 消融的 advantage 融合；三个 value loss
         # 始终独立计算，不参与动态负载权重。
@@ -624,7 +633,7 @@ class Go2ArmRoughCfgPPO( LeggedRobotCfgPPO ):
         activation = "elu"
         init_noise_std = 0.8
         min_noise_std = 0.05
-        max_noise_std = 0.5
+        max_noise_std = MAX_NOISE_STD
         ema_tau = 0.01
         gate_rho = 0.3
         gate_type = "temporal_tcn"
