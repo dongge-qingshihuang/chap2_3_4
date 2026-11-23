@@ -218,15 +218,24 @@ class HIMRolloutStorage:
                 self.timeout_bootstrap_values[step],
                 next_values,
             )
-            continues = (
-                (1.0 - self.dones[step].float()).bool() | timeout
+            not_done = 1.0 - self.dones[step].float()
+            # Timeout bootstraps the value of the terminal observation, but it
+            # still ends the episode. Never recurse GAE into the reset episode.
+            bootstrap = (
+                not_done.bool() | timeout
             ).float()
+            advantage_continues = (
+                not_done * (1.0 - timeout.float())
+            )
             delta = (
                 self.rewards[step]
-                + continues * gamma * next_values
+                + bootstrap * gamma * next_values
                 - self.values[step]
             )
-            advantage = delta + continues * gamma * lam * advantage
+            advantage = (
+                delta
+                + advantage_continues * gamma * lam * advantage
+            )
             self.returns[step] = advantage + self.values[step]
 
         # Compute and normalize the advantages.

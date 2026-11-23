@@ -430,7 +430,7 @@ class Chapter4PolicyTest(unittest.TestCase):
 
 
 class TimeoutBootstrapTest(unittest.TestCase):
-    def test_timeout_uses_terminal_next_value_and_next_step_is_normal(self):
+    def test_timeout_bootstraps_without_cross_episode_recursion(self):
         storage = HIMRolloutStorage(
             1, 2, [1], [1], [1], value_dim=1
         )
@@ -443,11 +443,7 @@ class TimeoutBootstrapTest(unittest.TestCase):
             torch.zeros(1, 1), gamma=0.9, lam=0.8
         )
         expected_step1 = 2.0
-        expected_step0 = (
-            1.0
-            + 0.9 * 5.0
-            + 0.9 * 0.8 * expected_step1
-        )
+        expected_step0 = 1.0 + 0.9 * 5.0
         self.assertAlmostEqual(
             storage.returns[0, 0, 0].item(), expected_step0, places=6
         )

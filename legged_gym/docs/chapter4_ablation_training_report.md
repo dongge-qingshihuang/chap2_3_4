@@ -267,11 +267,15 @@ arm links, and arm base mount are not part of this calculation.
 
 New stability reward:
 
-- `stab__foot_spacing = -2.0`
+- `stab__foot_spacing = -1.0`
 - target front/rear lateral stance width: `0.24 m`
 - target minimum distance between any two feet: `0.18 m`
 - positive normalized squared shortfalls are multiplied by the negative scale,
   so narrow stances receive a penalty
+
+The retraining configuration softens spacing shaping from `-2.0` to `-1.0` and
+leg smoothness from `-0.01` to `-0.005` to allow more flexible support
+adjustments and faster disturbance responses.
 
 The first implementation accidentally returned a negative shortfall and was
 stopped after two updates. A corrected run was launched at

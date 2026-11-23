@@ -553,12 +553,12 @@ class Go2ArmRoughCfg( LeggedRobotCfg ):
             stab__orientation = -0.2
             stab__base_height = -1.0
             stab__feet_slip = -0.01
-            stab__foot_spacing = -2.0
+            stab__foot_spacing = -1.0
 
             energy__joint_power = -2e-5
             energy__dof_acc = -2.5e-7
             energy__action_rate = -0.01
-            energy__smoothness = -0.01
+            energy__smoothness = -0.005
 
             # Shared safety terms for the complete formal ablation protocol.
             termination = TERMINATION_PENALTY_SCALE
