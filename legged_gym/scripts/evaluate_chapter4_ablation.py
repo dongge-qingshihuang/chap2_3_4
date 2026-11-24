@@ -298,7 +298,23 @@ def evaluate_single(args):
         "static_arm_completion_events": 0,
         "joint_pass_events": 0,
         "arm_trajectory_attempts": int(env.num_envs),
+        "base_stable_steps": 0,
+        "locomotion_ok_steps": 0,
+        "stable_locomotion_steps": 0,
+        "base_contact_steps": 0,
+        "stable_locomotion_passes": 0,
     }
+    attempt_steps = torch.zeros(env.num_envs, device=env.device)
+    attempt_progress = torch.zeros(env.num_envs, device=env.device)
+    attempt_required = torch.zeros(env.num_envs, device=env.device)
+    attempt_tracking_sum = torch.zeros(env.num_envs, device=env.device)
+    attempt_stable = torch.ones(
+        env.num_envs, dtype=torch.bool, device=env.device
+    )
+    roll_abs_samples = []
+    pitch_abs_samples = []
+    base_ang_xy_samples = []
+    base_vz_samples = []
 
     for _ in range(args.steps):
         set_base_commands(env, targets, speeds)
@@ -378,6 +394,71 @@ def evaluate_single(args):
                 env.root_states[valid, 2].sum().item()
             )
             total["reward"] += rewards[valid].sum().item()
+            base_height = env._get_base_heights()
+            base_stable = (
+                valid
+                & (base_height >= 0.25)
+                & (torch.abs(env.roll) <= 0.35)
+                & (torch.abs(env.pitch) <= 0.35)
+                & ~env.base_contact_buf
+            )
+            commands_xy = env.executed_commands_snapshot[:, :2]
+            command_speed = commands_xy.norm(dim=-1)
+            safe_speed = command_speed.clamp_min(1e-6)
+            signed_projection = (
+                env.base_lin_vel[:, :2] * commands_xy
+            ).sum(dim=-1) / safe_speed
+            tracking = torch.exp(
+                -torch.square(
+                    commands_xy - env.base_lin_vel[:, :2]
+                ).sum(dim=-1)
+                / env.cfg.rewards.tracking_sigma
+            )
+            locomotion_ok = valid & (tracking >= 0.7)
+            stable_locomotion = base_stable & locomotion_ok
+            total["base_stable_steps"] += int(
+                base_stable.sum().item()
+            )
+            total["locomotion_ok_steps"] += int(
+                locomotion_ok.sum().item()
+            )
+            total["stable_locomotion_steps"] += int(
+                stable_locomotion.sum().item()
+            )
+            total["base_contact_steps"] += int(
+                (valid & env.base_contact_buf).sum().item()
+            )
+            roll_abs_samples.append(
+                env.roll[valid].abs().detach().cpu()
+            )
+            pitch_abs_samples.append(
+                env.pitch[valid].abs().detach().cpu()
+            )
+            base_ang_xy_samples.append(
+                env.base_ang_vel[valid, :2].norm(dim=-1)
+                .detach()
+                .cpu()
+            )
+            base_vz_samples.append(
+                env.base_lin_vel[valid, 2].abs().detach().cpu()
+            )
+            attempt_steps += valid.float()
+            attempt_progress += torch.where(
+                valid,
+                signed_projection * env.dt,
+                torch.zeros_like(attempt_progress),
+            )
+            attempt_required += torch.where(
+                valid,
+                command_speed * env.dt,
+                torch.zeros_like(attempt_required),
+            )
+            attempt_tracking_sum += torch.where(
+                valid,
+                tracking,
+                torch.zeros_like(attempt_tracking_sum),
+            )
+            attempt_stable &= ~valid | base_stable
             total["arm_trajectory_finished_steps"] += int(
                 (
                     env.arm_trajectory_finished[valid]
@@ -488,6 +569,9 @@ def evaluate_single(args):
                 )
 
         done_ids = dones.nonzero(as_tuple=False).flatten()
+        done_mask = torch.zeros_like(target_changed)
+        done_mask[done_ids] = True
+        attempt_stable[done_ids] = False
         total["episodes"] += len(done_ids)
         if len(done_ids):
             total["fall"] += int(
@@ -499,6 +583,39 @@ def evaluate_single(args):
             total["timeout"] += int(
                 env.time_out_buf[done_ids].sum().item()
             )
+
+        finalized = target_changed
+        if finalized.any():
+            progress_ratio = (
+                attempt_progress
+                / attempt_required.clamp_min(1e-6)
+            ).clamp(0.0, 1.0)
+            mean_tracking = (
+                attempt_tracking_sum
+                / attempt_steps.clamp_min(1.0)
+            )
+            stable_pass = (
+                finalized
+                & attempt_stable
+                & (attempt_steps > 0)
+                & (
+                    attempt_required
+                    > env.cfg.rewards.moving_arm_completion_min_command_speed
+                    * attempt_steps
+                    * env.dt
+                )
+                & (progress_ratio >= args.joint_min_progress)
+                & (mean_tracking >= args.joint_min_tracking)
+            )
+            total["stable_locomotion_passes"] += int(
+                stable_pass.sum().item()
+            )
+            reset_attempts = target_changed | done_mask
+            attempt_steps[reset_attempts] = 0.0
+            attempt_progress[reset_attempts] = 0.0
+            attempt_required[reset_attempts] = 0.0
+            attempt_tracking_sum[reset_attempts] = 0.0
+            attempt_stable[reset_attempts] = True
 
         distance_to_target = torch.norm(
             targets - env.root_states[:, :2], dim=-1
@@ -517,6 +634,14 @@ def evaluate_single(args):
     episodes = max(total["episodes"], 1)
     distance = max(total["distance"], 1e-6)
     arm_attempts = max(total["arm_trajectory_attempts"], 1)
+    def sample_statistics(samples, quantile=False):
+        if not samples:
+            return 0.0
+        values = torch.cat(samples)
+        if quantile:
+            return torch.quantile(values, 0.95).item()
+        return values.pow(2).mean().sqrt().item()
+
     result = {
         "mode": args.mode,
         "terrain": args.terrain,
@@ -566,6 +691,44 @@ def evaluate_single(args):
         ),
         "base_height_below_0_25_rate": (
             total["low_base_steps"] / steps
+        ),
+        "roll_rms_rad": sample_statistics(roll_abs_samples),
+        "roll_p95_rad": sample_statistics(
+            roll_abs_samples, quantile=True
+        ),
+        "pitch_rms_rad": sample_statistics(pitch_abs_samples),
+        "pitch_p95_rad": sample_statistics(
+            pitch_abs_samples, quantile=True
+        ),
+        "base_ang_vel_xy_rms_rad_s": sample_statistics(
+            base_ang_xy_samples
+        ),
+        "base_ang_vel_xy_p95_rad_s": sample_statistics(
+            base_ang_xy_samples, quantile=True
+        ),
+        "base_vertical_velocity_rms_mps": sample_statistics(
+            base_vz_samples
+        ),
+        "base_vertical_velocity_p95_mps": sample_statistics(
+            base_vz_samples, quantile=True
+        ),
+        "base_contact_step_rate": (
+            total["base_contact_steps"] / steps
+        ),
+        "base_stable_step_fraction": (
+            total["base_stable_steps"] / steps
+        ),
+        "locomotion_ok_step_fraction": (
+            total["locomotion_ok_steps"] / steps
+        ),
+        "stable_locomotion_step_fraction": (
+            total["stable_locomotion_steps"] / steps
+        ),
+        "stable_locomotion_pass_events": (
+            total["stable_locomotion_passes"]
+        ),
+        "stable_locomotion_pass_rate": (
+            total["stable_locomotion_passes"] / arm_attempts
         ),
         "arm_trajectory_finished_fraction": (
             total["arm_trajectory_finished_steps"] / steps
