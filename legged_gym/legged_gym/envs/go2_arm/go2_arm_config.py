@@ -69,9 +69,29 @@ _ABLATION_CONFIGS = {
     "B0R": dict(multi_critic=True, payload_aware=True, load_aware=True,
                 weight_supervision=1.0, weight_smooth=0.01,
                 trajectory_curriculum=True, pretrained=True,
+                actor_lr_multiplier=0.5, entropy_coef=0.002,
+                entropy_coef_final=0.002, max_noise_std=0.30,
                 base_action_residual=True,
                 freeze_pretrained_actor=False,
                 moving_arm_completion_reward=False),
+    "B0A": dict(multi_critic=True, payload_aware=True, load_aware=True,
+                weight_supervision=1.0, weight_smooth=0.01,
+                trajectory_curriculum=True, pretrained=True,
+                actor_lr_multiplier=0.5, entropy_coef=0.002,
+                entropy_coef_final=0.002, max_noise_std=0.30,
+                base_action_residual=False,
+                freeze_pretrained_actor=False,
+                moving_arm_completion_reward=False,
+                arm_tracking_reward=True),
+    "B0RA": dict(multi_critic=True, payload_aware=True, load_aware=True,
+                 weight_supervision=1.0, weight_smooth=0.01,
+                 trajectory_curriculum=True, pretrained=True,
+                 actor_lr_multiplier=0.5, entropy_coef=0.002,
+                 entropy_coef_final=0.002, max_noise_std=0.30,
+                 base_action_residual=True,
+                 freeze_pretrained_actor=False,
+                 moving_arm_completion_reward=False,
+                 arm_tracking_reward=True),
     "B1": dict(multi_critic=False, payload_aware=True, load_aware=False,
                weight_supervision=0.0, weight_smooth=0.0,
                trajectory_curriculum=True, pretrained=True),
@@ -239,6 +259,12 @@ MOVING_ARM_COMPLETION_MIN_COMMAND_SPEED = 0.05
 MOVING_ARM_COMPLETION_SCALE = MOVING_ARM_COMPLETION_BONUS / (
     LeggedRobotCfg.sim.dt * LeggedRobotCfg.control.decimation
 )
+ARM_TRACKING_REWARD_ENABLED = bool(
+    _ABLATION.get("arm_tracking_reward", False)
+)
+ARM_TRACKING_REWARD_SCALE = 0.2
+ARM_TRACKING_POSITION_NORM = 0.06
+ARM_TRACKING_ORIENTATION_NORM = 0.25
 
 
 class Go2ArmRoughCfg( LeggedRobotCfg ):
@@ -551,6 +577,11 @@ class Go2ArmRoughCfg( LeggedRobotCfg ):
 
             task__tracking_lin_vel = 1.0
             task__tracking_ang_vel = 0.5
+            task__arm_tracking = (
+                ARM_TRACKING_REWARD_SCALE
+                if ARM_TRACKING_REWARD_ENABLED
+                else 0.0
+            )
             task__moving_arm_completion = (
                 MOVING_ARM_COMPLETION_SCALE
                 if MOVING_ARM_COMPLETION_ENABLED
@@ -586,6 +617,10 @@ class Go2ArmRoughCfg( LeggedRobotCfg ):
             MOVING_ARM_COMPLETION_MIN_COMMAND_SPEED
         )
         moving_arm_completion_enabled = MOVING_ARM_COMPLETION_ENABLED
+        arm_tracking_position_norm = ARM_TRACKING_POSITION_NORM
+        arm_tracking_orientation_norm = (
+            ARM_TRACKING_ORIENTATION_NORM
+        )
         max_contact_force = 100. # forces above this value are penalized
         clearance_height_target = -0.20
         manip_weight_lpy = 1.0

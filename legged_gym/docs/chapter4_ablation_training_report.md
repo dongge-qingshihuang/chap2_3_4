@@ -436,6 +436,9 @@ The four controlled groups are:
   the arm-conditioned residual, and no pretrained checkpoint.
 - `B0R`: the original B0 dynamic-critic configuration plus the
   arm-conditioned residual, without the moving-completion reward.
+- `B0A`: stabilized B0 plus a dense end-effector tracking reward.
+- `B0RA`: stabilized B0 plus both the arm-conditioned residual and the dense
+  end-effector tracking reward.
 
 Smoke checks pass for zero-output initialization, bounded residual output,
 residual-only gradients, storage round-trip, checkpoint initialization, joint
@@ -458,6 +461,27 @@ three-critic dynamic weighting plus the arm-conditioned residual.
 
 `B0R` preserves B0's partial fine-tuning scope and dynamic critic weighting,
 adds only the arm-conditioned residual, and is trained for 20000 updates.
+
+The three stability-first follow-ups share B0's stabilized optimizer settings:
+
+```text
+max_noise_std = 0.30
+entropy_coef = 0.002
+actor_lr_multiplier = 0.5
+foot_spacing = -1.0
+smoothness = -0.005
+```
+
+The dense arm tracking term is placed in the Task critic:
+
+```text
+r_arm_tracking =
+exp(-(position_error / 0.06)^2
+    -(orientation_error / 0.25)^2)
+```
+
+Its scale is `0.2`. This provides a per-step endpoint signal, while the
+one-shot moving completion reward remains disabled for all three runs.
 
 ### Moving-arm completion reward
 

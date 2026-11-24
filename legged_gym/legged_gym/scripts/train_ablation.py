@@ -57,6 +57,7 @@ def main():
         f"{train_cfg.policy.base_action_residual_enabled} "
         f"moving_arm_completion="
         f"{env_cfg.rewards.moving_arm_completion_enabled} "
+        f"arm_tracking={env_cfg.rewards.scales.task__arm_tracking > 0} "
         f"actor_frozen={train_cfg.runner.freeze_pretrained_actor} "
         f"pretrained={bool(train_cfg.runner.pretrained_base_checkpoint)} "
         f"run={args.experiment_name}/{args.run_name}",

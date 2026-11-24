@@ -3377,6 +3377,20 @@ class Go2ArmEnv(BaseTask):
         # 随后立即重采样新目标，所以每个 settle 事件只发一次）
         return self.settle_buf.float()
 
+    def _reward_arm_tracking(self):
+        """Dense end-effector tracking over the current reference command."""
+        position_error = (
+            self.arm_pos_err_norm
+            / float(self.cfg.rewards.arm_tracking_position_norm)
+        )
+        orientation_error = (
+            self.arm_ori_err_norm
+            / float(self.cfg.rewards.arm_tracking_orientation_norm)
+        )
+        return torch.exp(
+            -(position_error.square() + orientation_error.square())
+        )
+
     def _reward_moving_arm_completion(self):
         reward = self.moving_completion_pending_reward.clone()
         self.moving_completion_pending_reward.zero_()
